@@ -17,7 +17,6 @@
 ### 【第一次使用：配置 API Key（免费，约 3 分钟）】
   1. 打开 https://open.bigmodel.cn 注册 → 头像 → API Keys → 新建
   2. 把 config\typo_config.example.ini 复制一份，改名为 typo_config.ini
-     （模板已随仓库分发，包含全部配置项；typo_config.ini 不会提交到 git）
   3. 用记事本打开 config\typo_config.ini，把 Key 填到 api_key= 后面
   4. 确认 enabled=true，保存，重新双击「mosq-ai-fix.exe」
 
