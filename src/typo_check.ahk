@@ -41,7 +41,8 @@ if !A_IsAdmin && A_Args.Length = 0 {
 ; v5.0 变更（第二版本）：
 ;  1. 新增语句润色功能：按 F9（可配置 [hotkey] polish_key）
 ;     改写当前语句，使其更得体、通顺、易理解
-;  2. 润色优先处理选中的文本，无选区时润色整个输入框内容
+;  2. 润色默认处理整个输入框内容（与错字检查一致，全选），
+;     不再优先读取选中文本
 ;  3. 润色结果弹窗预览，支持手动微调后"替换原文"
 ;  注意：检查/润色文本会发送到智谱云端，请勿输入敏感内容
 ; =============================================================
@@ -354,7 +355,7 @@ CheckAndFix(*) {
 }
 
 ; ---------------- 语句润色主流程（v5.0，默认 F9）----------------
-; 读取文本：优先润色【选中的文本】；无选区时润色整个输入框内容
+; 读取文本：与错字检查一致，默认全选整个输入框内容
 PolishText(*) {
     global PolishKey
     ; 通用模式：任意可编辑输入框都能润色（微信/浏览器/记事本/编辑器等）
@@ -363,9 +364,11 @@ PolishText(*) {
         return
     }
 
-    ; 1. 保存剪贴板，先读选区内容
+    ; 1. 保存剪贴板，读取输入框全部内容（与错字检查一致：默认全选）
     saved := ClipboardAll()
     A_Clipboard := ""
+    Send("^a")
+    Sleep(80)
     Send("^c")
     if !ClipWait(0.8) {
         A_Clipboard := saved
@@ -373,18 +376,6 @@ PolishText(*) {
         return
     }
     text := A_Clipboard
-    if Trim(text) = "" {
-        ; 无选区 → 全选再读
-        Send("^a")
-        Sleep(80)
-        Send("^c")
-        if !ClipWait(0.8) {
-            A_Clipboard := saved
-            ShowAutoCloseTip("没读到文字", "请先点击输入框，再按 " . PolishKey, 1000, "info")
-            return
-        }
-        text := A_Clipboard
-    }
     A_Clipboard := saved
 
     if Trim(text) = "" {
