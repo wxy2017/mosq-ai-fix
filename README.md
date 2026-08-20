@@ -18,3 +18,8 @@
   1. 打开 https://open.bigmodel.cn 注册 → 头像 → API Keys → 新建
   2. 复制 Key，用记事本打开 config\typo_config.ini，填到 api_key= 后面
   3. 确认 enabled=true，保存，重新双击「错字检查.exe」
+
+### 【注意事项】
+  - 请配置 API Key 后再使用，否则无法检查错别字
+  - 本地开启VPN情况下，注意网络是否能访问
+  - 未使用管理员权限运行时，部分输入框可能无法抓取文字
