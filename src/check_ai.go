@@ -1,13 +1,16 @@
-// check_ai.go — 文本错字与用词检查（Go 版）· 智谱 GLM-4-Flash 云端校对
+// check_ai.go — 文本校对工具（Go 版）· 智谱 GLM-4-Flash 云端
 //
-// 用法: check_ai.exe <input.txt> <output.txt>
-//   input.txt  : UTF-8 待检查文本
-//   output.txt : 结果输出，每行一条: 错误词(Tab)正确词(Tab)原因
-//                特殊标记: __NO_KEY__ 未配置Key | __NONE__ 无错误 | __ERROR__xxx 失败
+// 用法: check_ai.exe [-polish] <input.txt> <output.txt>
+//   无 -polish（默认，错字/用词检查）:
+//     output.txt 每行一条: 错误词(Tab)正确词(Tab)原因
+//     特殊标记: __NO_KEY__ 未配置Key | __NONE__ 无错误 | __ERROR__xxx 失败
+//   -polish（v5.0 新增，语句润色）:
+//     output.txt 直接写润色后的整段文本
+//     特殊标记: __NO_KEY__ 未配置Key | __ERROR__xxx 失败
 //
 // 与 Python 版 check_ai.py 接口完全一致，行为对齐：
 //   - 读取 <工具根>/config/typo_config.ini（[ai]/[log] 两个段）
-//   - 调用智谱 API（严格模式提示词）
+//   - 调用智谱 API（检查用严格模式提示词，润色用润色提示词）
 //   - debug=true 时写 <工具根>/config/ai_debug.log
 //
 // 编译: go build -o bin/check_ai.exe .
@@ -53,6 +56,18 @@ const systemPrompt = `你是一个严谨的中文校对助手，负责检查用�
 
 只输出 JSON，不要输出任何其他文字，格式：
 {"errors": [{"wrong": "错误写法", "right": "正确写法", "reason": "简短原因(5字内，如: 错别字/用词不当/谐音字)"}]}`
+
+// polishPrompt 润色模式（v5.0）：改写得更得体、通顺、易理解，不改原意
+const polishPrompt = `你是一个中文文字润色助手，把用户输入的语句改写得更得体、通顺、易理解。
+要求：
+1. 保持原意不变：不增删事实性内容，不改动数字、英文、人名、地名、产品名、专业术语
+2. 修正语序不通顺、口语化冗余、重复啰嗦、搭配不当、语气生硬等问题，
+   使表达更书面、得体、流畅
+3. 不要过度改写：保持原文的语气和自然度，避免文艺腔、过度书面化；
+   原文已通顺得体时，原样返回即可
+4. 保留原文的段落结构，不改变整体意思和语气风格（如正式/轻松）的基调
+
+只输出润色后的文本本身，不要任何解释、不要加引号、不要用代码块包裹。`
 
 var logPath string // ai_debug.log 绝对路径（main 中初始化）
 
@@ -153,11 +168,11 @@ func debugLog(cfg *config, msg string) {
 
 // ---------- 智谱 API ----------
 
-func callAPI(cfg *config, text string) (string, error) {
+func callAPI(cfg *config, prompt, text string) (string, error) {
 	payload := map[string]any{
 		"model": cfg.model,
 		"messages": []map[string]string{
-			{"role": "system", "content": systemPrompt},
+			{"role": "system", "content": prompt},
 			{"role": "user", "content": text},
 		},
 		"temperature": 0.1,
@@ -263,6 +278,29 @@ func parseErrors(content string) []errItem {
 	return out
 }
 
+// cleanPolish 清理润色输出：去掉代码块包裹和模型误加的首尾引号
+func cleanPolish(s string) string {
+	s = strings.TrimSpace(s)
+	if strings.HasPrefix(s, "```") {
+		lines := strings.Split(s, "\n")
+		if len(lines) > 2 {
+			s = strings.Join(lines[1:len(lines)-1], "\n")
+		} else {
+			s = ""
+		}
+	}
+	s = strings.TrimSpace(s)
+	if len([]rune(s)) >= 2 {
+		r := []rune(s)
+		first, last := r[0], r[len(r)-1]
+		if (first == '"' && last == '"') || (first == '“' && last == '”') ||
+			(first == '「' && last == '」') || (first == '\'' && last == '\'') {
+			s = strings.TrimSpace(string(r[1 : len(r)-1]))
+		}
+	}
+	return s
+}
+
 // ---------- 主流程 ----------
 
 func main() {
@@ -282,15 +320,22 @@ func main() {
 		rawLog(fmt.Sprintf("脚本启动 | 参数数=%d | argv=%v", len(os.Args), os.Args))
 	}
 
-	if len(os.Args) < 3 {
-		fmt.Println("用法: check_ai.exe <input.txt> <output.txt>")
-		fmt.Println("  例: check_ai.exe in.txt out.txt")
+	// 模式判定：check_ai.exe [-polish] <input.txt> <output.txt>
+	polishMode := len(os.Args) >= 4 && os.Args[1] == "-polish"
+	inIdx, outIdx := 1, 2
+	if polishMode {
+		inIdx, outIdx = 2, 3
+	}
+	if len(os.Args) < outIdx+1 {
+		fmt.Println("用法: check_ai.exe [-polish] <input.txt> <output.txt>")
+		fmt.Println("  检查错字: check_ai.exe in.txt out.txt")
+		fmt.Println("  润色语句: check_ai.exe -polish in.txt out.txt")
 		if cfg != nil && cfg.debug {
 			rawLog("退出: 参数不足，需要 input.txt 和 output.txt 两个参数")
 		}
 		return
 	}
-	inPath, outPath := os.Args[1], os.Args[2]
+	inPath, outPath := os.Args[inIdx], os.Args[outIdx]
 
 	// 读输入文本（容忍 UTF-8 BOM）
 	data, err := os.ReadFile(inPath)
@@ -308,7 +353,8 @@ func main() {
 		return
 	}
 
-	debugLog(cfg, fmt.Sprintf("开始检查 | 模型=%s | base_url=%s | 文本长度=%d",
+	debugLog(cfg, fmt.Sprintf("开始%s | 模型=%s | base_url=%s | 文本长度=%d",
+		map[bool]string{true: "润色", false: "检查"}[polishMode],
 		cfg.model, cfg.baseURL, len(text)))
 
 	// 未配置 Key
@@ -327,7 +373,11 @@ func main() {
 	// 调用云端 AI
 	debugLog(cfg, fmt.Sprintf("发送请求 | text长度=%d | model=%s | url=%s", len(text), cfg.model, cfg.baseURL))
 	start := time.Now()
-	content, err := callAPI(cfg, text)
+	prompt := systemPrompt
+	if polishMode {
+		prompt = polishPrompt
+	}
+	content, err := callAPI(cfg, prompt, text)
 	if err != nil {
 		elapsed := time.Since(start).Seconds()
 		debugLog(cfg, fmt.Sprintf("调用失败 | 耗时=%.2fs | %v", elapsed, err))
@@ -341,6 +391,19 @@ func main() {
 		preview = preview[:200]
 	}
 	debugLog(cfg, fmt.Sprintf("收到响应 | 耗时=%.2fs | 预览=%s", elapsed, preview))
+
+	// 润色模式：直接写润色后文本
+	if polishMode {
+		polished := cleanPolish(content)
+		if polished == "" {
+			debugLog(cfg, "解析结果 | 润色文本为空")
+			_ = os.WriteFile(outPath, []byte("__ERROR__空响应\n"), 0644)
+			return
+		}
+		debugLog(cfg, fmt.Sprintf("解析结果 | 润色后长度=%d", len(polished)))
+		_ = os.WriteFile(outPath, []byte(polished), 0644)
+		return
+	}
 
 	errors := parseErrors(content)
 	debugLog(cfg, fmt.Sprintf("解析结果 | 错误数=%d", len(errors)))

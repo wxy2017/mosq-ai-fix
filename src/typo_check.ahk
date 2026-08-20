@@ -14,10 +14,14 @@ if !A_IsAdmin && A_Args.Length = 0 {
 }
 
 ; =============================================================
-; 文本错字检查工具  v4.0（Go 版 · 免 Python 环境）
+; 文本校对工具（错字检查 + 语句润色）  v5.0（Go 版 · 免 Python 环境）
 ; 用法：在任意可编辑的输入框（微信聊天框、网页文本框、
-;       记事本、代码编辑器等）打好字后，按 F8 即可检查错别字
-;       发现错误会弹窗列出，点"一键修正"自动替换回输入框
+;       记事本、代码编辑器等）打好字后：
+;         按 F8 检查错别字/用词不当，发现错误会弹窗列出，
+;             点"一键修正"自动替换回输入框
+;         按 F9 润色当前语句，改写得更得体、通顺、易理解，
+;             弹窗预览（可编辑微调），点"替换原文"回填
+;       两个热键都可在 typo_config.ini 的 [hotkey] 段修改
 ; 说明：本工具不修改任何程序，仅模拟复制/粘贴，安全无风险
 ;
 ; v4.0 变更（由 Python 版重构为 Go 版）：
@@ -34,7 +38,12 @@ if !A_IsAdmin && A_Args.Length = 0 {
 ; v4.3 变更：
 ;  1. 校对能力升级：除错别字外，新增"明显的用词不当/语句不通顺"
 ;     检查（如"出了以上方法"应为"除了以上方法"）
-;  注意：检查文本会发送到智谱云端，请勿输入敏感内容
+; v5.0 变更（第二版本）：
+;  1. 新增语句润色功能：按 F9（可配置 [hotkey] polish_key）
+;     改写当前语句，使其更得体、通顺、易理解
+;  2. 润色优先处理选中的文本，无选区时润色整个输入框内容
+;  3. 润色结果弹窗预览，支持手动微调后"替换原文"
+;  注意：检查/润色文本会发送到智谱云端，请勿输入敏感内容
 ; =============================================================
 
 ; 目录结构（v4.2）：基准目录 BaseDir = 工具根
@@ -42,7 +51,8 @@ if !A_IsAdmin && A_Args.Length = 0 {
 ;   配置在 config\，校对程序在 src\bin\
 global BaseDir := A_IsCompiled ? A_ScriptDir : A_ScriptDir "\.."
 global CfgIni := BaseDir "\config\typo_config.ini"  ; 配置文件
-global TriggerKey := LoadHotkey()   ; 从 typo_config.ini 的 [hotkey] key 读取，失败回退 F8
+global TriggerKey := LoadHotkey()      ; [hotkey] key 读取，失败回退 F8（错字检查）
+global PolishKey := LoadPolishHotkey() ; [hotkey] polish_key 读取，失败回退 F9（语句润色）
 
 ; 源码版运行时用项目图标作托盘图标（编译版自动使用嵌入图标）
 if !A_IsCompiled {
@@ -59,13 +69,19 @@ if A_Args.Length > 0 && A_Args[1] = "-selftest" {
 
 RunSelfTest() {
     FileAppend("AI 校对: " (IsAIEnabled() ? "已启用" : "未启用（编辑 typo_config.ini 配置 API Key 后启用）") "`n", "*")
-    FileAppend("触发热键: " TriggerKey "（改 typo_config.ini 的 [hotkey] key 后重启生效）`n", "*")
+    FileAppend("检查热键: " TriggerKey "（改 typo_config.ini 的 [hotkey] key 后重启生效）`n", "*")
+    FileAppend("润色热键: " PolishKey "（改 typo_config.ini 的 [hotkey] polish_key 后重启生效）`n", "*")
     FileAppend("右下角提醒: " (TrayTipEnabled() ? "开启（[ui] tray_tip=true）" : "关闭（[ui] tray_tip=false）") "`n", "*")
     sample := "今天的会议按步就班进行，希望大家再接再励。既使遇到问题也要冷静面对。他亨受生活，工作也很努立。出了以上方法还有其他方法吗。"
     ai := RunAICheck(sample)
-    FileAppend("状态: " ai[1] "，结果 " ai[2].Length " 条`n", "*")
+    FileAppend("检查状态: " ai[1] "，结果 " ai[2].Length " 条`n", "*")
     for r in ai[2]
-        FileAppend(r[1] " -> " r[2] " | " r[3] "`n", "*")
+        FileAppend("  " r[1] " -> " r[2] " | " r[3] "`n", "*")
+    ; 润色自检：结果不稳定，只验证调用成功且输出非空
+    p := RunPolish("我今天真的挺想去的，但是时间上面好像有点不太够。")
+    FileAppend("润色状态: " p[1] "，结果长度 " StrLen(p[2]) " 字`n", "*")
+    if p[2] != ""
+        FileAppend("  " p[2] "`n", "*")
 }
 
 ; ---------------- 焦点可编辑检测 ----------------
@@ -108,6 +124,17 @@ LoadHotkey() {
             return k
     }
     return "F8"
+}
+
+; 从 typo_config.ini 的 [hotkey] polish_key 读取润色热键（v5.0），失败回退 F9
+LoadPolishHotkey() {
+    global CfgIni
+    try {
+        k := Trim(IniRead(CfgIni, "hotkey", "polish_key"))
+        if k != ""
+            return k
+    }
+    return "F9"
 }
 
 ; ---------------- 右下角提醒开关 ----------------
@@ -194,16 +221,74 @@ RunAICheck(text) {
     return [status, results]
 }
 
+; ---------------- 调用 check_ai.exe 润色模式（v5.0）----------------
+; 返回 [status, polishedText]
+;   status : "ok" 正常 | "no_key" 未配置 Key | "no_python" 未能启动程序 | "error" 调用失败
+;   text   : 润色后的整段文本（ok 时）
+RunPolish(text) {
+    global BaseDir
+    exePath := BaseDir "\src\bin\check_ai.exe"
+    inFile := BaseDir "\src\tmp_polish_in.txt"
+    outFile := BaseDir "\src\tmp_polish_out.txt"
+    FileAppend(text, inFile, "UTF-8")
+
+    ran := false
+    try {
+        if FileExist(outFile)
+            FileDelete(outFile)
+        RunWait('"' exePath '" -polish "' inFile '" "' outFile '"', BaseDir, "Hide")
+        ; 输出文件生成 = 校对程序确实执行了
+        if FileExist(outFile)
+            ran := true
+    } catch {
+        ran := false
+    }
+
+    if !ran {
+        if FileExist(inFile)
+            FileDelete(inFile)
+        return ["no_python", ""]
+    }
+
+    content := ""
+    if FileExist(outFile) {
+        content := FileRead(outFile, "UTF-8-RAW")
+        FileDelete(outFile)
+    }
+    if FileExist(inFile)
+        FileDelete(inFile)
+    content := Trim(content, "`r`n")
+
+    if SubStr(content, 1, 2) = "__" {
+        if InStr(content, "NO_KEY")
+            return ["no_key", ""]
+        return ["error", ""]
+    }
+    return ["ok", content]
+}
+
 ; ---------------- 注册热键 ----------------
+hotkeyErr := ""
 try {
     Hotkey(TriggerKey, CheckAndFix)
 } catch {
-    MsgBox("热键 " TriggerKey " 已被其他程序占用。请用记事本打开 typo_config.ini，把 [hotkey] 段的 key 改成其他按键（如 F9），保存后重新双击「错字检查.exe」。`n`n格式示例：F8、F9、^F8(Ctrl+F8)、!F8(Alt+F8)、+F8(Shift+F8)", "错字检查", "Iconi")
+    hotkeyErr := TriggerKey
+}
+try {
+    Hotkey(PolishKey, PolishText)
+} catch {
+    if hotkeyErr = ""
+        hotkeyErr := PolishKey
+    else
+        hotkeyErr .= "、" PolishKey
+}
+if hotkeyErr != "" {
+    MsgBox("热键 " hotkeyErr " 已被其他程序占用。请用记事本打开 typo_config.ini，修改 [hotkey] 段的 key 或 polish_key 为其他按键，保存后重新双击「mosq-ai-fix.exe」。`n`n格式示例：F8、F9、^F8(Ctrl+F8)、!F8(Alt+F8)、+F8(Shift+F8)", "错字检查", "Iconi")
     ExitApp()
 }
 
 if IsAIEnabled()
-    TrayTip("错字检查已运行（AI 校对已开启）", "在任意输入框按 " TriggerKey " 即可检查", 3)
+    TrayTip("错字检查已运行（AI 已开启）", "任意输入框按 " TriggerKey " 检查错字，按 " PolishKey " 润色语句", 3)
 else
     TrayTip("错字检查已运行", "AI 未启用：编辑 typo_config.ini 填入 API Key 后重启（见使用说明.txt）", 5)
 
@@ -266,6 +351,112 @@ CheckAndFix(*) {
 
     ; 4. 弹窗展示结果（记住原窗口句柄：点"一键修正"时要把焦点还给原输入框才能粘贴回去）
     ShowResultGui(text, ai[2], WinGetID("A"))
+}
+
+; ---------------- 语句润色主流程（v5.0，默认 F9）----------------
+; 读取文本：优先润色【选中的文本】；无选区时润色整个输入框内容
+PolishText(*) {
+    global PolishKey
+    ; 通用模式：任意可编辑输入框都能润色（微信/浏览器/记事本/编辑器等）
+    if !IsEditableFocused() {
+        MsgBox("当前焦点不在文本输入框里，请先点击要润色的输入框（微信聊天框、网页文本框、记事本等均可），再按 " PolishKey, "语句润色", "Iconi")
+        return
+    }
+
+    ; 1. 保存剪贴板，先读选区内容
+    saved := ClipboardAll()
+    A_Clipboard := ""
+    Send("^c")
+    if !ClipWait(0.8) {
+        A_Clipboard := saved
+        ShowAutoCloseTip("没读到文字", "请先点击输入框，再按 " . PolishKey, 1000, "info")
+        return
+    }
+    text := A_Clipboard
+    if Trim(text) = "" {
+        ; 无选区 → 全选再读
+        Send("^a")
+        Sleep(80)
+        Send("^c")
+        if !ClipWait(0.8) {
+            A_Clipboard := saved
+            ShowAutoCloseTip("没读到文字", "请先点击输入框，再按 " . PolishKey, 1000, "info")
+            return
+        }
+        text := A_Clipboard
+    }
+    A_Clipboard := saved
+
+    if Trim(text) = "" {
+        ShowAutoCloseTip("没有可润色的文字", "先在输入框里输入内容，再按 " . PolishKey, 1000, "info")
+        return
+    }
+
+    ; 2. 检查 AI 配置
+    if !IsAIEnabled() {
+        MsgBox("AI 校对未启用。请用记事本打开 typo_config.ini，填入智谱 API Key 并设 enabled=true（免费，获取步骤见使用说明.txt）", "语句润色", "Iconi")
+        return
+    }
+
+    ; 3. 调用云端 AI 润色（约 1-5 秒，鼠标旁会显示"润色中"提示）
+    ToolTip("正在润色，请稍候…")
+    p := RunPolish(text)
+    ToolTip()
+
+    if p[1] = "no_key" {
+        MsgBox("未检测到 API Key。请用记事本打开 typo_config.ini 填入（免费获取步骤见使用说明.txt）", "语句润色", "Iconi")
+        return
+    }
+    if p[1] = "no_python" {
+        MsgBox("未能启动校对程序 check_ai.exe。请确认工具目录里有 check_ai.exe（Go 编译，无需安装 Python），且未被杀毒软件拦截；仍不行请重新解压/复制整个工具目录。", "语句润色", "Iconi")
+        return
+    }
+    if p[1] = "error" {
+        MsgBox("AI 调用失败，请检查网络连接后重试；如超时可把 typo_config.ini 里的 timeout 调大（当前 15 秒）", "语句润色", "Iconi")
+        return
+    }
+
+    ; 4. 弹窗预览润色结果（可编辑微调），确认后替换
+    ShowPolishGui(text, p[2], WinGetID("A"))
+}
+
+; ---------------- 润色结果弹窗（v5.0）----------------
+; 展示润色后的文本，Edit 可直接编辑微调；点"替换原文"回填输入框
+ShowPolishGui(orig, polished, targetHwnd) {
+    myGui := Gui("+AlwaysOnTop", "语句润色 · 预览")
+    myGui.SetFont("s10", "Microsoft YaHei")
+    myGui.Add("Text", "w560", "润色结果（可直接编辑微调，点「替换原文」回填输入框）：")
+    edit := myGui.Add("Edit", "w560 h200 WantTab", polished)
+
+    btnApply := myGui.Add("Button", "w130 h32 Default", "替换原文")
+    btnClose := myGui.Add("Button", "x+12 w100 h32", "取消")
+    btnApply.OnEvent("Click", (*) => ApplyPolish(myGui, edit, targetHwnd))
+    btnClose.OnEvent("Click", (*) => myGui.Destroy())
+    myGui.Show()
+}
+
+; ---------------- 润色替换回填（v5.0）----------------
+ApplyPolish(myGui, editCtrl, targetHwnd) {
+    newText := editCtrl.Text
+    if Trim(newText) = "" {
+        MsgBox("润色结果为空，无法替换。请在弹窗里手动编辑内容后再点「替换原文」，或点「取消」。", "语句润色", "Iconi")
+        return
+    }
+
+    saved := ClipboardAll()
+    A_Clipboard := newText
+    myGui.Hide()               ; 先隐藏弹窗，露出原窗口
+    WinActivate(targetHwnd)    ; 把焦点还给原输入框（关键修复）
+    Sleep(150)                 ; 等窗口激活完成
+    Send("^a")
+    Sleep(80)
+    Send("^v")
+    Sleep(120)
+    A_Clipboard := saved
+    myGui.Destroy()
+    ; 右下角提醒可按配置关闭（[ui] tray_tip=false 时不弹）
+    if TrayTipEnabled()
+        TrayTip("润色完成", "已替换为润色后的文本", 3)
 }
 
 ; ---------------- 轻提示（主题卡片 + 淡入淡出，约 1 秒后自动关闭） ----------------
