@@ -29,3 +29,6 @@
   - 可自定义使用其他大模型
   - 本地开启VPN情况下，注意网络是否能访问
   - 未使用管理员权限运行时，部分输入框可能无法抓取文字
+
+### 【程序目录】
+<img width="286" height="105" alt="image" src="https://github.com/user-attachments/assets/e45b3bc4-a784-4820-9950-b3ac8a810d87" />
