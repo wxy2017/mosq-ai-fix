@@ -9,15 +9,17 @@
   使用【免费】的智谱云端大模型（GLM-4-Flash）检查错别字和明显的用词不当（如"出了以上方法"应为"除了以上方法"），并弹窗列出
 
 ### 【使用方法】
-  1. 双击「错字检查.exe」
+  1. 双击「mosq-ai-fix.exe」
   2. 点进输入框打好字 → 按 F8 → 等 1~5 秒
   3. 弹窗列出错误 → 点「一键修正」自动替换，或「关闭」放弃
      （没错误或输入框没文字时，提示约 1 秒自动消失）
 
 ### 【第一次使用：配置 API Key（免费，约 3 分钟）】
   1. 打开 https://open.bigmodel.cn 注册 → 头像 → API Keys → 新建
-  2. 复制 Key，用记事本打开 config\typo_config.ini，填到 api_key= 后面
-  3. 确认 enabled=true，保存，重新双击「错字检查.exe」
+  2. 把 config\typo_config.example.ini 复制一份，改名为 typo_config.ini
+     （模板已随仓库分发，包含全部配置项；typo_config.ini 不会提交到 git）
+  3. 用记事本打开 config\typo_config.ini，把 Key 填到 api_key= 后面
+  4. 确认 enabled=true，保存，重新双击「mosq-ai-fix.exe」
 
 ### 【注意事项】
   - 请配置 API Key 后再使用，否则无法检查
