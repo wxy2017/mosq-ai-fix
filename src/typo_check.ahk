@@ -31,6 +31,9 @@ if !A_IsAdmin && A_Args.Length = 0 {
 ;  1. 新增编译版「错字检查.exe」（Ahk2Exe 编译，双击即用，
 ;     不再需要 AutoHotkey 运行时和 bat 启动器）
 ;  2. 基准目录 BaseDir 兼容源码/编译两种运行方式
+; v4.3 变更：
+;  1. 校对能力升级：除错别字外，新增"明显的用词不当/语句不通顺"
+;     检查（如"出了以上方法"应为"除了以上方法"）
 ;  注意：检查文本会发送到智谱云端，请勿输入敏感内容
 ; =============================================================
 
@@ -58,7 +61,7 @@ RunSelfTest() {
     FileAppend("AI 校对: " (IsAIEnabled() ? "已启用" : "未启用（编辑 typo_config.ini 配置 API Key 后启用）") "`n", "*")
     FileAppend("触发热键: " TriggerKey "（改 typo_config.ini 的 [hotkey] key 后重启生效）`n", "*")
     FileAppend("右下角提醒: " (TrayTipEnabled() ? "开启（[ui] tray_tip=true）" : "关闭（[ui] tray_tip=false）") "`n", "*")
-    sample := "今天的会议按步就班进行，希望大家再接再励。既使遇到问题也要冷静面对。他亨受生活，工作也很努立。"
+    sample := "今天的会议按步就班进行，希望大家再接再励。既使遇到问题也要冷静面对。他亨受生活，工作也很努立。出了以上方法还有其他方法吗。"
     ai := RunAICheck(sample)
     FileAppend("状态: " ai[1] "，结果 " ai[2].Length " 条`n", "*")
     for r in ai[2]
@@ -272,7 +275,7 @@ CheckAndFix(*) {
 ; kind 参数：ok=绿色成功(✓)   info=蓝色提示(ℹ，如"输入框里没有文字")
 ; 注意：必须用全局引用 TipGuiRef 持有 Gui 对象——AHK v2 中若引用计数归零，
 ;       窗口会被自动销毁，导致淡出定时器访问 Hwnd 时抛 "Gui has no window"
-ShowAutoCloseTip(title := "未发现错别字", subtitle := "AI 校对通过，可以放心使用", durationMs := 1000, kind := "ok") {
+ShowAutoCloseTip(title := "未发现错字或用词问题", subtitle := "AI 校对通过，可以放心使用", durationMs := 1000, kind := "ok") {
     global TipGuiRef
     ; 主题色与图标
     if kind = "info" {
