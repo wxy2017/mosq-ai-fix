@@ -1,3 +1,4 @@
 echo __pycache__/ >> .gitignore
 echo *.pyc >> .gitignore
 echo .env >> .gitignore
+config/typo_config.ini
