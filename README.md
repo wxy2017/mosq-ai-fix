@@ -14,7 +14,7 @@
   3. 弹窗列出错误 → 点「一键修正」自动替换，或「关闭」放弃
      （没错误或输入框没文字时，提示约 1 秒自动消失）
 
-### 【第一次使用：配置 API Key（免费，约 3 分钟）】
+### 【第一次使用：配置 API Key（免费）】
   1. 打开 https://open.bigmodel.cn 注册 → 头像 → API Keys → 新建
   2. 把 config\typo_config.example.ini 复制一份，改名为 typo_config.ini
   3. 用记事本打开 config\typo_config.ini，把 Key 填到 api_key= 后面
