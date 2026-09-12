@@ -2,3 +2,8 @@ __pycache__/
 *.pyc
 .env
 config/typo_config.ini
+config/typo_config - deepSeek.ini
+config/typo_config - Freeapi.ini
+config/typo_config - 智谱.ini
+.cache/
+.workbuddy/

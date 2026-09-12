@@ -20,6 +20,8 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -32,78 +34,74 @@ import (
 )
 
 // systemPrompt 严格召回模式：错别字 + 用词不当 + 易混词/叠字/漏字/音近字（v4.5）
-// v4.5 变更：专攻"合法词但用错"的音近字误用（如 出了→除）
-//   - 新增★音近字强制排查：对每个字逐一试换同音/近音字看是否更通顺
-//   - step A 强化为逐字近音替换检查（最高频漏报点）
-//   - temperature 0.1→0.2，降低过度保守
-// v4.4 变更（召回优先：用户勾选确认，误报成本低）：
-//   - wrong 必须是原文逐字一致的连续片段（防一键修正失配、提升召回）
-//   - 错误类型扩到 8 类：新增"易混同音词""多字叠字""漏字缺字"
-//   - 客观错别字类"宁可多报"，主观用词不当仍需语义明显
-//   - 逐句覆盖、抑制空数组偏置、加 few-shot 示例
-const systemPrompt = `你是一个严谨的中文校对助手，负责检查用户输入文字中的错别字、用词不当及各类文字错误。
-采用【严格召回模式】：客观错别字类宁可多报可商榷的疑似错误，也不要漏报（最终由用户逐条确认，误报成本低）。
+const systemPrompt = `你是一个严谨的中文校对助手，采用严格召回模式：宁可多报可商榷的疑似错误，也不要漏报（最终由用户逐条确认，误报成本低）。
 
-请逐句默读检查全文，不要只看开头几句，对每一句都要认真排查，以下错误类型都要找：
-1. 错别字：同音字、形近字误用，要逐字比对尤其警惕形近字（如"因该"应为"应该"、"我门"应为"我们"、"未"应为"末"、"己"应为"已"）
-2. 易混同音/近音词：登录/登陆（应为登录）、截至/截止、必须/必需、启示/启事、作为/做为（应为作为）、权利/权力。只在语境明显用错方向时才报，方向必须报对，不要把本就正确的写法改成另一种
-3. 成语误用：如"按步就班"应为"按部就班"、"一愁莫展"应为"一筹莫展"
-4. 的/地/得 误用
+请检查以下错误类型：
+1. 错别字（同音字、形近字误用，如"因该"→"应该"、"我门"→"我们"）
+2. 易混同音/近音词：登录/登陆（应为登录）、截至/截止、必须/必需、启示/启事、作为/做为（应为作为）、权利/权力
+3. 成语误用：如"按步就班"→"按部就班"、"一愁莫展"→"一筹莫展"
+4. 的/地/得误用
 5. 多字/叠字重复：如"的的"、"了了"、"是是"
 6. 漏字/缺字：因漏字导致语句不通顺（把含漏字的片段整段替换补全）
-7. 网络谐音错别字：灰常/非常、杯具/悲剧、神马/什么、木有/没有、酱紫/这样子
-8. 明显的用词不当/语句不通顺：词义混淆、介词或助词误用、明显搭配错误（如"在次感谢"应为"再次感谢"）。仅报这类语义明显错误的项
-★ 音近字误用（最易漏报，务必对每个字逐一排查）：句中某词单独看是合法词，但放进本句意思不通顺；若把其中某字换成同音/近音字后整句才通顺、才符合本意——即使该词本身合法也必须报。典型：'出了以上方法'应为'除了以上方法'（出→除 近音）、'既使下雨'应为'即使下雨'（既→即）、'以经完成'应为'已经完成'（以→已）、'按装'应为'安装'（按→安）、'防碍'应为'妨碍'（防→妨）。判断口诀：该词合法≠用对，要看整句意思。
+7. 网络谐音错别字：灰常→非常、杯具→悲剧、神马→什么、木有→没有、酱紫→这样子
+8. 明显的用词不当/语句不通顺：词义混淆、介词或助词误用、明显搭配错误（如"在次感谢"→"再次感谢"）
+★ 音近字误用（最易漏报，务必对每个字逐一排查）：句中某词单独看是合法词，但放进本句意思不通顺；若把其中某字换成同音/近音字后整句才通顺、才符合本意——即使该词本身合法也必须报。典型：'出了以上方法'→'除了以上方法'（出→除 近音）、'既使下雨'→'即使下雨'（既→即）、'以经完成'→'已经完成'（以→已）、'按装'→'安装'（按→安）、'防碍'→'妨碍'（防→妨）
 
-输出要求（严格遵守）：
-- wrong 必须是【原文中逐字一致的连续片段】，right 是把它替换成的正确写法（字数可多可少）
+输出要求：
+- wrong 必须是原文中逐字一致的连续片段，right 是替换后的正确写法（字数可多可少）
 - 同一错误多次出现只报一次
-- 以下不算错误，不要报：人名、地名、专业术语、英文、数字、已通用的网络词（吐槽、网红、给力、打卡、yyds、绝绝子）
+- 不要报：人名、地名、专业术语、英文、数字、已通用的网络词（吐槽、网红、给力、打卡、yyds、绝绝子）
 - 不要改写句子、不要改标点、不要改句式、不要重组语序
-- 只要发现 1 个及以上疑似错误就务必报出，不要为了"保险"而输出空数组；确实没有才输出空数组
+- 只要发现 1 个及以上疑似错误就务必报出，不要为了“保险”而输出空数组；确实没有才输出空数组
+- 只输出 JSON，不要输出任何其他文字，格式：{"errors":[{"wrong":"错误写法","right":"正确写法","reason":"简短原因，如: 错别字/谐音字/易混词/成语/的得地/叠字/漏字/用词不当"}]}
 
-逐字排查要求（内部默想，不要输出分析过程）：对句中每个字都过一遍——有没有同音或近音的字，替换后整句更通顺、更符合本意？尤其★音近字类，该词合法≠用对，不要因为某词是合法词就跳过。
+示例：
+输入："我觉得因该出了以上方法，在次感谢"
+输出：{"errors":[{"wrong":"因该","right":"应该","reason":"错别字"},{"wrong":"出了","right":"除了","reason":"用词不当"},{"wrong":"在次","right":"再次","reason":"易混词"}]}`
 
-只输出 JSON，不要输出任何其他文字，格式：
-{"errors":[{"wrong":"错误写法","right":"正确写法","reason":"简短原因，如: 错别字/谐音字/易混词/成语/的得地/叠字/漏字/用词不当"}]}
-
-示例（仅示意格式）：
-输入"我觉得因该出了以上方法，在次感谢"
-{"errors":[{"wrong":"因该","right":"应该","reason":"错别字"},{"wrong":"出了","right":"除了","reason":"用词不当"},{"wrong":"在次","right":"再次","reason":"易混词"}]}`
-
-// polishPrompt 润色模式（v5.0）：改写得更得体、通顺、易理解，不改原意
-const polishPrompt = `你是一个中文文字润色助手，把用户输入的语句改写得更得体、通顺、易理解。
-要求：
-1. 保持原意不变：不增删事实性内容，不改动数字、英文、人名、地名、产品名、专业术语
-2. 修正语序不通顺、口语化冗余、重复啰嗦、搭配不当、语气生硬等问题，
-   使表达更书面、得体、流畅
-3. 不要过度改写：保持原文的语气和自然度，避免文艺腔、过度书面化；
-   原文已通顺得体时，原样返回即可
-4. 保留原文的段落结构，不改变整体意思和语气风格（如正式/轻松）的基调
-
-只输出润色后的文本本身，不要任何解释、不要加引号、不要用代码块包裹。`
+// polishPrompt 增强润色模式：参考WorkBuddy增强提示词，使润色更专业、得体
+const polishPrompt = `你是一个资深的中文编辑和写作老师，专长于润色各种场景的中文文本，使其更加得体、准确、流畅且富有感染力，同时严格保留原意和关键信息。
+任务：对用户提供的中文段落进行润色改写。
+核心原则：
+1. 绝对保持原意不变：不添加、删除或修改任何事实信息、数据、专有名词（人名、地名、机构名）、英文术语、数字、日期时间等客观内容。
+2. 仅改进语言表达：修正语法错误、用词不当、搭配错误；改善语序不通顺、口语化表达、重复冗余、语气生硬；使句子更加书面化、连贯、有逻辑性。
+3. 提升可读性和雅度：适当使用书面化表达，但避免过于晦涩或文雅过度；保持原文的基本语气和风格（如正式报告保持正式，轻松聊天保持轻松自然）。
+4. 段落结构保持：不改变段落划分和整体逻辑顺序；如有列表或编号，保持其格式。
+5. 处理特殊内容：对代码、公式、表格等非自然语言内容保持原样；对引用内容保持原样但可适当调整前后连接句使其流畅。
+输出要求：
+- 只输出润色后的完整文本，不要添加任何解释、评论或标记。
+- 不要使用代码块、引号或任何额外符号包裹输出。
+- 如果原文本身已经非常得体通顺，则直接返回原文。
+- 保持输出与输入的换行格式一致。
+示例：
+输入：他很快的跑完了比赛，得了第一名。
+输出：他迅速完成了比赛，获得第一名。
+输入：由于天气不好，所以我们决定取消今天的活动。
+输出：鉴于天气原因，我们决定取消今天的活动。`
 
 var logPath string // ai_debug.log 绝对路径（main 中初始化）
 
 // ---------- 配置 ----------
 
 type config struct {
-	enabled bool
-	apiKey  string
-	model   string
-	baseURL string
-	timeout int
-	maxText int
-	debug   bool
+	enabled    bool
+	apiKey     string
+	model      string
+	baseURL    string
+	timeout    int
+	maxText    int
+	debug      bool
+	serverPort string
 }
 
 // loadConfig 解析 <工具根>/config/typo_config.ini（兼容 ; 和 # 注释）
 func loadConfig(path string) *config {
 	cfg := &config{
-		model:   "glm-4-flash",
-		baseURL: "https://open.bigmodel.cn/api/paas/v4/chat/completions",
-		timeout: 8,
-		maxText: 500,
+		model:      "glm-4-flash",
+		baseURL:    "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+		timeout:    8,
+		maxText:    500,
+		serverPort: "18765",
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -154,6 +152,11 @@ func loadConfig(path string) *config {
 			case "debug":
 				cfg.debug = strings.EqualFold(val, "true")
 			}
+		case "server":
+			switch key {
+			case "port":
+				cfg.serverPort = val
+			}
 		}
 	}
 	return cfg
@@ -203,8 +206,16 @@ func callAPI(cfg *config, prompt, text string) (string, error) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+cfg.apiKey)
 
-	client := &http.Client{Timeout: time.Duration(cfg.timeout) * time.Second}
-	resp, err := client.Do(req)
+	if httpClient == nil {
+		httpClient = &http.Client{
+			Timeout: time.Duration(cfg.timeout) * time.Second,
+			Transport: &http.Transport{
+				MaxIdleConns:    10,
+				IdleConnTimeout: 90 * time.Second,
+			},
+		}
+	}
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -234,6 +245,180 @@ func callAPI(cfg *config, prompt, text string) (string, error) {
 		return "", fmt.Errorf("no choices in response")
 	}
 	return data.Choices[0].Message.Content, nil
+}
+
+// ---------- 性能优化：缓存 / 分块 / 常驻服务 ----------
+
+const promptVersion = "v4.5" // 缓存失效标记：提示词变更时改此值
+
+var httpClient *http.Client
+var cacheDir string
+
+func sha256hex(s string) string {
+	h := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(h[:])
+}
+
+func cachePath(key string) string {
+	return filepath.Join(cacheDir, sha256hex(key)+".json")
+}
+
+func cacheGet(key string) ([]byte, bool) {
+	data, err := os.ReadFile(cachePath(key))
+	if err != nil {
+		return nil, false
+	}
+	return data, true
+}
+
+func cachePut(key string, data []byte) {
+	_ = os.WriteFile(cachePath(key), data, 0644)
+}
+
+// coreCheck 单段检查（含缓存）；返回模型原始 JSON 或缓存内容
+func coreCheck(cfg *config, text string) (string, error) {
+	key := "check|" + promptVersion + "|" + cfg.model + "|" + cfg.baseURL + "|" + text
+	if data, ok := cacheGet(key); ok {
+		return string(data), nil
+	}
+	content, err := callAPI(cfg, systemPrompt, text)
+	if err != nil {
+		return "", err
+	}
+	cachePut(key, []byte(content))
+	return content, nil
+}
+
+// corePolish 单段润色（含缓存）
+func corePolish(cfg *config, text string) (string, error) {
+	key := "polish|" + promptVersion + "|" + cfg.model + "|" + cfg.baseURL + "|" + text
+	if data, ok := cacheGet(key); ok {
+		return string(data), nil
+	}
+	content, err := callAPI(cfg, polishPrompt, text)
+	if err != nil {
+		return "", err
+	}
+	cachePut(key, []byte(content))
+	return content, nil
+}
+
+// processCheck 对外检查入口：超长自动分块（带重叠），合并去重
+func processCheck(cfg *config, text string) (string, error) {
+	runes := []rune(text)
+	if len(runes) <= cfg.maxText {
+		return coreCheck(cfg, text)
+	}
+	overlap := 30
+	merged := make([]errItem, 0)
+	seen := make(map[string]bool)
+	for i := 0; i < len(runes); i += (cfg.maxText - overlap) {
+		end := i + cfg.maxText
+		if end > len(runes) {
+			end = len(runes)
+		}
+		chunk := string(runes[i:end])
+		content, err := coreCheck(cfg, chunk)
+		if err != nil {
+			return "", err
+		}
+		for _, e := range parseErrors(content) {
+			k := e.Wrong + "\t" + e.Right
+			if !seen[k] {
+				seen[k] = true
+				merged = append(merged, e)
+			}
+		}
+		if end == len(runes) {
+			break
+		}
+	}
+	if len(merged) == 0 {
+		return "__NONE__", nil
+	}
+	b, _ := json.Marshal(apiResult{Errors: merged})
+	return string(b), nil
+}
+
+// processPolish 对外润色入口：超长分块拼接
+func processPolish(cfg *config, text string) (string, error) {
+	runes := []rune(text)
+	if len(runes) <= cfg.maxText {
+		return corePolish(cfg, text)
+	}
+	overlap := 30
+	var sb strings.Builder
+	for i := 0; i < len(runes); i += (cfg.maxText - overlap) {
+		end := i + cfg.maxText
+		if end > len(runes) {
+			end = len(runes)
+		}
+		chunk := string(runes[i:end])
+		content, err := corePolish(cfg, chunk)
+		if err != nil {
+			return "", err
+		}
+		sb.WriteString(cleanPolish(content))
+		if end == len(runes) {
+			break
+		}
+	}
+	return sb.String(), nil
+}
+
+// startServer 常驻本地服务：复用连接池，提供 /check /polish 端点
+func startServer(cfg *config) {
+	httpClient = &http.Client{
+		Timeout: time.Duration(cfg.timeout) * time.Second,
+		Transport: &http.Transport{
+			MaxIdleConns:    10,
+			IdleConnTimeout: 90 * time.Second,
+		},
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/check", func(w http.ResponseWriter, r *http.Request) {
+		// 未配置 Key：与 CLI 模式一致返回 __NO_KEY__
+		if cfg == nil || cfg.apiKey == "" {
+			io.WriteString(w, "__NO_KEY__")
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		text := strings.TrimSpace(string(body))
+		if text == "" {
+			io.WriteString(w, "__NONE__")
+			return
+		}
+		content, err := processCheck(cfg, text)
+		if err != nil {
+			io.WriteString(w, "__ERROR__"+err.Error())
+			return
+		}
+		io.WriteString(w, formatCheckOutput(content))
+	})
+	mux.HandleFunc("/polish", func(w http.ResponseWriter, r *http.Request) {
+		if cfg == nil || cfg.apiKey == "" {
+			io.WriteString(w, "__NO_KEY__")
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		text := strings.TrimSpace(string(body))
+		if text == "" {
+			io.WriteString(w, "")
+			return
+		}
+		content, err := processPolish(cfg, text)
+		if err != nil {
+			io.WriteString(w, "__ERROR__"+err.Error())
+			return
+		}
+		if strings.TrimSpace(content) == "" {
+			io.WriteString(w, "__ERROR__空响应")
+			return
+		}
+		io.WriteString(w, content)
+	})
+	addr := "127.0.0.1:" + cfg.serverPort
+	_ = http.ListenAndServe(addr, mux)
 }
 
 // ---------- 结果解析 ----------
@@ -292,6 +477,22 @@ func parseErrors(content string) []errItem {
 	return out
 }
 
+// formatCheckOutput 将模型 JSON 转为前端可解析的 Tab 行格式（与 CLI 模式输出完全一致）：
+//   - 无错误返回 "__NONE__"
+//   - 有错误返回多行 "错误\t正确\t原因\n..."
+// 供 CLI 写文件与常驻服务 /check 端点共用，保证两种调用路径输出一致
+func formatCheckOutput(content string) string {
+	errors := parseErrors(content)
+	if len(errors) == 0 {
+		return "__NONE__"
+	}
+	var sb strings.Builder
+	for _, e := range errors {
+		sb.WriteString(e.Wrong + "\t" + e.Right + "\t" + e.Reason + "\n")
+	}
+	return sb.String()
+}
+
 // cleanPolish 清理润色输出：去掉代码块包裹和模型误加的首尾引号
 func cleanPolish(s string) string {
 	s = strings.TrimSpace(s)
@@ -330,6 +531,17 @@ func main() {
 	logPath = filepath.Join(rootDir, "config", "ai_debug.log")
 
 	cfg := loadConfig(iniPath)
+	if cfg == nil {
+		cfg = &config{serverPort: "18765"}
+	}
+	cacheDir = filepath.Join(rootDir, ".cache")
+	_ = os.MkdirAll(cacheDir, 0755)
+
+	// 常驻服务模式：启动本地 HTTP 服务后退出（由前端拉起）
+	if len(os.Args) >= 2 && os.Args[1] == "-server" {
+		startServer(cfg)
+		return
+	}
 	if cfg != nil && cfg.debug {
 		rawLog(fmt.Sprintf("脚本启动 | 参数数=%d | argv=%v", len(os.Args), os.Args))
 	}
@@ -378,20 +590,15 @@ func main() {
 		return
 	}
 
-	// 超长截断（按字符 rune 截断，避免按字节切出半个汉字产生乱码）
-	runes := []rune(text)
-	if len(runes) > cfg.maxText {
-		text = string(runes[:cfg.maxText])
-	}
-
-	// 调用云端 AI
+	// 调用云端 AI（内部含分块与缓存，超长自动切片）
 	debugLog(cfg, fmt.Sprintf("发送请求 | text长度=%d | model=%s | url=%s", len(text), cfg.model, cfg.baseURL))
 	start := time.Now()
-	prompt := systemPrompt
+	var content string
 	if polishMode {
-		prompt = polishPrompt
+		content, err = processPolish(cfg, text)
+	} else {
+		content, err = processCheck(cfg, text)
 	}
-	content, err := callAPI(cfg, prompt, text)
 	if err != nil {
 		elapsed := time.Since(start).Seconds()
 		debugLog(cfg, fmt.Sprintf("调用失败 | 耗时=%.2fs | %v", elapsed, err))
@@ -421,14 +628,13 @@ func main() {
 
 	errors := parseErrors(content)
 	debugLog(cfg, fmt.Sprintf("解析结果 | 错误数=%d", len(errors)))
+	out := formatCheckOutput(content)
 	if len(errors) == 0 {
-		_ = os.WriteFile(outPath, []byte("__NONE__\n"), 0644)
-		return
+		debugLog(cfg, "解析结果 | 无错误(__NONE__)")
+	} else {
+		for _, e := range errors {
+			debugLog(cfg, fmt.Sprintf("识别错误 | %s -> %s | %s", e.Wrong, e.Right, e.Reason))
+		}
 	}
-	var sb strings.Builder
-	for _, e := range errors {
-		sb.WriteString(e.Wrong + "\t" + e.Right + "\t" + e.Reason + "\n")
-		debugLog(cfg, fmt.Sprintf("识别错误 | %s -> %s | %s", e.Wrong, e.Right, e.Reason))
-	}
-	_ = os.WriteFile(outPath, []byte(sb.String()), 0644)
+	_ = os.WriteFile(outPath, []byte(out+"\n"), 0644)
 }

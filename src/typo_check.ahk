@@ -29,7 +29,7 @@ if !A_IsAdmin && A_Args.Length = 0 {
 ;     单文件、免安装、无 Python 环境依赖），接口完全兼容
 ;  2. 不再需要 python_cmd 配置，直接运行同目录 check_ai.exe
 ;  3. 其余功能不变：任意可编辑输入框按 F8、焦点可编辑检测、
-;     严格模式 AI 校对（智谱 GLM-4-Flash）、一键修正回填、
+;     严格模式 AI 校对（云端大模型）、一键修正回填、
 ;     调试日志 ai_debug.log
 ; v4.2 变更：
 ;  1. 新增编译版「错字检查.exe」（Ahk2Exe 编译，双击即用，
@@ -44,7 +44,12 @@ if !A_IsAdmin && A_Args.Length = 0 {
 ;  2. 润色默认处理整个输入框内容（与错字检查一致，全选），
 ;     不再优先读取选中文本
 ;  3. 润色结果弹窗预览，支持手动微调后"替换原文"
-;  注意：检查/润色文本会发送到智谱云端，请勿输入敏感内容
+;  注意：检查/润色文本会发送到云端大模型，请勿输入敏感内容
+; v5.1 变更（性能优化）：
+;  1. 后端常驻服务：首次使用时拉起 check_ai.exe -server 常驻本地
+;     (127.0.0.1:ServerPort)，后续检查/润色均走 HTTP 调用，
+;     免去每次校对都冷启动进程的开销，并复用连接池与磁盘缓存
+;  2. 相同/相似文本二次调用近乎瞬时（命中磁盘缓存）
 ; =============================================================
 
 ; 目录结构（v4.2）：基准目录 BaseDir = 工具根
@@ -54,6 +59,13 @@ global BaseDir := A_IsCompiled ? A_ScriptDir : A_ScriptDir "\.."
 global CfgIni := BaseDir "\config\typo_config.ini"  ; 配置文件
 global TriggerKey := LoadHotkey()      ; [hotkey] key 读取，失败回退 F8（错字检查）
 global PolishKey := LoadPolishHotkey() ; [hotkey] polish_key 读取，失败回退 F9（语句润色）
+global ServerPort := "18765"           ; 常驻服务端口（与 check_ai.go 默认一致，可被 [server] port 覆盖）
+try {
+    p := Trim(IniRead(CfgIni, "server", "port"))
+    if p != ""
+        ServerPort := p
+} catch {
+}
 
 ; 源码版运行时用项目图标作托盘图标（编译版自动使用嵌入图标）
 if !A_IsCompiled {
@@ -165,60 +177,119 @@ IsAIEnabled() {
         return false
 }
 
-; ---------------- 调用 check_ai.exe（Go 校对中间层）----------------
+; ---------------- 常驻服务（P0 性能优化：进程仅启动一次，复用连接与缓存）----------------
+; 后端 check_ai.exe -server 启动后常驻 127.0.0.1:ServerPort，
+; 前端通过 HTTP 调用 /check 与 /polish，免去每次校对都冷启动进程的开销，
+; 同时复用 Go 端的连接池与磁盘缓存（相同/相似文本二次调用近乎瞬时）。
+
+; 确保本地校对服务已启动：已运行则直接返回；未运行则拉起 check_ai.exe -server 并等待就绪
+EnsureServer() {
+    global BaseDir, ServerPort
+    if IsServerUp()
+        return true
+    exePath := BaseDir "\src\bin\check_ai.exe"
+    if !FileExist(exePath)
+        return false
+    Run('"' exePath '" -server', BaseDir, "Hide")
+    loop 60 {                     ; 最多等 6 秒让它监听端口
+        Sleep(100)
+        if IsServerUp()
+            return true
+    }
+    return false
+}
+
+; 探测服务是否就绪：向 /check 发空请求，期望 200（返回 __NONE__）
+IsServerUp() {
+    global ServerPort
+    try {
+        http := ComObject("WinHttp.WinHttpRequest.5.1")
+        http.Open("POST", "http://127.0.0.1:" ServerPort "/check", false)
+        http.SetRequestHeader("Content-Type", "text/plain; charset=utf-8")
+        http.SetTimeouts(1000, 1000, 1000, 1000)    ; 探测用短超时（resolve/connect/send/receive）
+        http.Send(" ")                         ; 发一个空格（空串 Send 在部分环境会报错）
+        return (http.Status = 200)
+    } catch {
+        return false
+    }
+}
+
+; 调用本地服务端点，返回 UTF-8 解码后的响应文本
+; endpoint: "check" 或 "polish"
+HttpPost(endpoint, text) {
+    global ServerPort
+    http := ComObject("WinHttp.WinHttpRequest.5.1")
+    http.Open("POST", "http://127.0.0.1:" ServerPort "/" endpoint, false)
+    http.SetRequestHeader("Content-Type", "text/plain; charset=utf-8")
+    http.SetTimeouts(3000, 3000, 30000, 30000)        ; resolve3s / connect3s / send30s / receive30s
+    ; 以 UTF-8 字节发送，避免中文被当成 ANSI/BSTR 丢失
+    stream := ComObject("ADODB.Stream")
+    stream.Type := 2                           ; adTypeText
+    stream.Charset := "utf-8"
+    stream.Open()
+    stream.WriteText(text)
+    stream.Position := 0
+    stream.Type := 1                           ; adTypeBinary
+    http.Send(stream.Read())
+    if (http.Status != 200)
+        throw Error("HTTP " http.Status)
+    return BytesToUtf8(http.ResponseBody)
+}
+
+; 将 WinHttpRequest 的二进制响应体按 UTF-8 正确解码为字符串（避免中文乱码）
+BytesToUtf8(body) {
+    stream := ComObject("ADODB.Stream")
+    stream.Type := 1                           ; adTypeBinary
+    stream.Open()
+    stream.Write(body)
+    stream.Position := 0
+    stream.Type := 2                           ; adTypeText
+    stream.Charset := "utf-8"
+    return stream.ReadText()
+}
+
+; ---------------- 调用本地常驻服务做错字检查 ----------------
 ; 返回 [status, results]
-;   status : "ok" 正常 | "no_key" 未配置 Key | "no_python" 未能启动程序 | "error" 调用失败
+;   status : "ok" 正常 | "no_key" 未配置 Key | "no_python" 未能启动服务 | "error" 调用失败
 ;   results: [[错误, 正确, 原因], ...]
 RunAICheck(text) {
-    global BaseDir
-    exePath := BaseDir "\src\bin\check_ai.exe"
-    inFile := BaseDir "\src\tmp_ai_in.txt"
-    outFile := BaseDir "\src\tmp_ai_out.txt"
-    FileAppend(text, inFile, "UTF-8")
-
-    ran := false
-    try {
-        if FileExist(outFile)
-            FileDelete(outFile)
-        RunWait('"' exePath '" "' inFile '" "' outFile '"', BaseDir, "Hide")
-        ; 输出文件生成 = 校对程序确实执行了
-        if FileExist(outFile)
-            ran := true
-    } catch {
-        ; exe 不存在或被占用
-        ran := false
-    }
-
-    if !ran {
-        if FileExist(inFile)
-            FileDelete(inFile)
+    ; 1. 确保常驻服务已启动（首次会拉起 check_ai.exe -server，仅一次）
+    if !EnsureServer()
         return ["no_python", []]
+
+    ; 2. 调用 /check；若服务异常则尝试重启一次再调用
+    try {
+        resp := HttpPost("check", text)
+    } catch {
+        if !EnsureServer() {
+            return ["error", []]
+        }
+        try {
+            resp := HttpPost("check", text)
+        } catch {
+            return ["error", []]
+        }
     }
 
+    ; 3. 解析与 CLI 模式完全一致的 Tab 行格式
     results := []
     status := "ok"
-    if FileExist(outFile) {
-        content := FileRead(outFile, "UTF-8-RAW")
-        for line in StrSplit(content, "`n", "`r") {
-            line := Trim(line)
-            if line = ""
-                continue
-            if SubStr(line, 1, 2) = "__" {
-                if InStr(line, "NO_KEY")
-                    status := "no_key"
-                else if InStr(line, "ERROR")
-                    status := "error"
-                ; __NONE__ 视为 ok（无错误）
-                continue
-            }
-            parts := StrSplit(line, "`t")
-            if parts.Length >= 3 && Trim(parts[1]) != ""
-                results.Push([Trim(parts[1]), Trim(parts[2]), Trim(parts[3])])
+    for line in StrSplit(resp, "`n", "`r") {
+        line := Trim(line)
+        if line = ""
+            continue
+        if SubStr(line, 1, 2) = "__" {
+            if InStr(line, "NO_KEY")
+                status := "no_key"
+            else if InStr(line, "ERROR")
+                status := "error"
+            ; __NONE__ 视为 ok（无错误）
+            continue
         }
-        FileDelete(outFile)
+        parts := StrSplit(line, "`t")
+        if parts.Length >= 3 && Trim(parts[1]) != ""
+            results.Push([Trim(parts[1]), Trim(parts[2]), Trim(parts[3])])
     }
-    if FileExist(inFile)
-        FileDelete(inFile)
     return [status, results]
 }
 
@@ -227,39 +298,25 @@ RunAICheck(text) {
 ;   status : "ok" 正常 | "no_key" 未配置 Key | "no_python" 未能启动程序 | "error" 调用失败
 ;   text   : 润色后的整段文本（ok 时）
 RunPolish(text) {
-    global BaseDir
-    exePath := BaseDir "\src\bin\check_ai.exe"
-    inFile := BaseDir "\src\tmp_polish_in.txt"
-    outFile := BaseDir "\src\tmp_polish_out.txt"
-    FileAppend(text, inFile, "UTF-8")
-
-    ran := false
-    try {
-        if FileExist(outFile)
-            FileDelete(outFile)
-        RunWait('"' exePath '" -polish "' inFile '" "' outFile '"', BaseDir, "Hide")
-        ; 输出文件生成 = 校对程序确实执行了
-        if FileExist(outFile)
-            ran := true
-    } catch {
-        ran := false
-    }
-
-    if !ran {
-        if FileExist(inFile)
-            FileDelete(inFile)
+    ; 1. 确保常驻服务已启动
+    if !EnsureServer()
         return ["no_python", ""]
+
+    ; 2. 调用 /polish；若服务异常则尝试重启一次再调用
+    try {
+        content := HttpPost("polish", text)
+    } catch {
+        if !EnsureServer() {
+            return ["error", ""]
+        }
+        try {
+            content := HttpPost("polish", text)
+        } catch {
+            return ["error", ""]
+        }
     }
 
-    content := ""
-    if FileExist(outFile) {
-        content := FileRead(outFile, "UTF-8-RAW")
-        FileDelete(outFile)
-    }
-    if FileExist(inFile)
-        FileDelete(inFile)
     content := Trim(content, "`r`n")
-
     if SubStr(content, 1, 2) = "__" {
         if InStr(content, "NO_KEY")
             return ["no_key", ""]
@@ -323,7 +380,7 @@ CheckAndFix(*) {
 
     ; 2. 检查 AI 配置
     if !IsAIEnabled() {
-        MsgBox("AI 校对未启用。请用记事本打开 typo_config.ini，填入智谱 API Key 并设 enabled=true（免费，获取步骤见使用说明.txt）", "错字检查", "Iconi")
+        MsgBox("AI 校对未启用。请用记事本打开 typo_config.ini，填入云端 API Key 并设 enabled=true（获取步骤见使用说明.txt）", "错字检查", "Iconi")
         return
     }
 
@@ -385,7 +442,7 @@ PolishText(*) {
 
     ; 2. 检查 AI 配置
     if !IsAIEnabled() {
-        MsgBox("AI 校对未启用。请用记事本打开 typo_config.ini，填入智谱 API Key 并设 enabled=true（免费，获取步骤见使用说明.txt）", "语句润色", "Iconi")
+        MsgBox("AI 校对未启用。请用记事本打开 typo_config.ini，填入云端 API Key 并设 enabled=true（获取步骤见使用说明.txt）", "语句润色", "Iconi")
         return
     }
 
