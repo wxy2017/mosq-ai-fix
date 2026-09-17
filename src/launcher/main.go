@@ -1,11 +1,16 @@
 // launcher — mosq-ai-fix.exe 启动器（GUI 子系统，无控制台窗口）
 //
-// 职责：双击后拉起真正的校对前端 src/typo_check.ahk（AutoHotkey v2），
-// 由它提供托盘图标、F8/F9 热键，并调用同目录的 check_ai.exe（Go 校对后端）。
+// 部署布局（v5.3）：本程序位于 <部署根>\，运行时依赖全部在 <部署根>\runtime\。
+//   <部署根>\mosq-ai-fix.exe   入口（本程序）
+//   <部署根>\config\app.ini    部署参数
+//   <部署根>\runtime\          typo_check.ahk + AutoHotkey64.exe + check_ai.exe + icon.ico
+//
+// 职责：双击后拉起 runtime 下的润色前端 typo_check.ahk（AutoHotkey v2），
+// 由它提供托盘图标、F9 润色热键，并调用同目录的 check_ai.exe（Go 润色后端）。
 // 本程序本身只负责启动，启动后即退出，不驻留。
 //
-// 编译（在 src/launcher 目录）：
-//   go build -ldflags "-H windowsgui" -o ../../mosq-ai-fix.exe .
+// 编译：推荐用 build\build.ps1（先 windres 再编译），或手动——
+//   cd src/launcher && go build -ldflags "-H windowsgui" -o ../../dist/mosq-ai-fix.exe .
 // 图标由同目录 app.syso（windres 从 src/assets/icon.ico 生成）自动嵌入。
 
 package main
@@ -22,11 +27,12 @@ func main() {
 	if err != nil {
 		return
 	}
-	rootDir := filepath.Dir(exePath) // mosq-ai-fix.exe 所在目录（工具根）
-	ahkExe := filepath.Join(rootDir, "src", "lib", "ahk", "AutoHotkey64.exe")
-	script := filepath.Join(rootDir, "src", "typo_check.ahk")
+	rootDir := filepath.Dir(exePath) // mosq-ai-fix.exe 所在目录（= 部署根 dist/）
+	runtimeDir := filepath.Join(rootDir, "runtime")
+	ahkExe := filepath.Join(runtimeDir, "AutoHotkey64.exe")
+	script := filepath.Join(runtimeDir, "typo_check.ahk")
 
-	// 应用开机自启动配置（仅 Windows；由 config\typo_config.ini [startup] auto_start 控制，默认关闭）。
+	// 应用开机自启动配置（仅 Windows；由 config\app.ini [startup] auto_start 控制，默认关闭）。
 	// 放在文件检查之前：自启动注册独立于当前文件是否齐备，更贴近"登录时运行本程序"的语义。
 	applyAutoStart(exePath, readAutoStart(rootDir))
 

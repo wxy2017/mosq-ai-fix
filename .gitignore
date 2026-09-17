@@ -1,9 +1,27 @@
+# ============ 部署区 dist/ ============
+# dist/ 是构建产物目录，由 build\build.ps1 生成
+# （含两个 exe、生成的前端副本、以及含真实密钥的 app.ini / presets）。
+# 不入库以保证仓库纯净、并避免密钥误传；需要分发时直接压缩 dist\ 即可。
+# 若希望 git 跟踪可分发版本，删掉下面这行，并另行为 app.ini / presets 加排除规则。
+dist/
+
+# ============ 个人凭据（不入库、也不随 dist 分发）============
+# 各厂商完整配置副本，含真实 api_key。仅你本机自用，build.ps1 不会复制到 dist\。
+build/templates/presets/
+
+# ============ 构建产物 ============
+# windres 由 app.rc 生成；须与 main.go 同目录（Go 才会自动嵌入），每次构建重新产出
+src/launcher/app.syso
+# Go 链接器覆盖运行中 exe 时留下的备份
+*~
+# build.ps1 的构建日志（含本机绝对路径，无需入库）
+build/build.log
+
+# ============ 运行时数据 ============
+.cache/
+.workbuddy/
+
+# ============ 其他 ============
 __pycache__/
 *.pyc
 .env
-config/typo_config.ini
-config/typo_config - deepSeek.ini
-config/typo_config - Freeapi.ini
-config/typo_config - 智谱.ini
-.cache/
-.workbuddy/

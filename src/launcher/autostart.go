@@ -6,11 +6,11 @@ import (
 	"strings"
 )
 
-// readAutoStart 读取 <工具根>/config/typo_config.ini 中 [startup] auto_start。
+// readAutoStart 读取 <部署根>/config/app.ini 中 [startup] auto_start。
 // 默认返回 false（关闭）；文件缺失或解析失败也视为关闭。
 // 该配置项控制是否将本程序写入 Windows 开机自启动（HKCU Run）。
 func readAutoStart(rootDir string) bool {
-	path := filepath.Join(rootDir, "config", "typo_config.ini")
+	path := filepath.Join(rootDir, "config", "app.ini")
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return false
