@@ -1,19 +1,23 @@
 // check_ai.go — 文本润色工具（Go 版）· 云端大模型
 //
-// 用法: check_ai.exe -polish <input.txt> <output.txt>
-//   output.txt 直接写润色后的整段文本
+// 用法: check_ai.exe -polish    <input.txt> <output.txt>   润色
+//       check_ai.exe -translate <input.txt> <output.txt>   翻译成简体中文
+//   output.txt 直接写处理后的整段文本
 //   特殊标记: __NO_KEY__ 未配置Key | __ERROR__xxx 失败
 //
 // 常驻服务模式: check_ai.exe -server
 //   监听 127.0.0.1:<[server] port>，提供
-//     POST /polish    润色（前端热键调用的唯一业务入口）
-//     POST /shutdown  优雅退出（供前端在退出时回收本进程）
+//     POST /polish     润色（前端 F9 调用）
+//     POST /translate  翻译成简体中文（前端 F10 调用）
+//     POST /shutdown   优雅退出（供前端在退出时回收本进程）
 //
-// v5.2 起移除错字检查（F8）功能，本程序仅负责语句润色（F9）。
+// v5.2 起移除错字检查（F8）功能，本程序专注语句润色与翻译。
 // v5.3 起移除磁盘缓存（原 <部署根>/.cache），每次调用均直连云端 API。
-// v5.5 起配置支持热重载：每次 /polish 前按 app.ini 的内容指纹判断是否重读，
+// v5.5 起配置支持热重载：每次请求前按 app.ini 的内容指纹判断是否重读，
 //   故改动 base_url/model/api_key 后无需重启本进程即刻生效（旧版本只在进程
 //   启动时读一次配置，而"关闭前端"并不会结束本进程，于是长期使用旧配置）。
+// v5.6 起新增翻译成中文能力：新增 /translate 端点与 -translate CLI 模式，
+//   与润色共用分块/日志/错误映射链路，仅提示词不同（translatePrompt）。
 // 部署布局（v5.3）：本 exe 位于 <部署根>\runtime\，其上一级即部署根
 //   - 读取 <部署根>/config/app.ini（[ai]/[log]/[server] 段）
 //   - 调用云端 API（润色提示词）
@@ -60,6 +64,28 @@ const polishPrompt = `你是一个资深的中文编辑和写作老师，专长�
 输出：鉴于天气原因，我们决定取消今天的活动。`
 
 var logPath string // ai_debug.log 绝对路径（main 中初始化）
+
+// translatePrompt 翻译模式：把用户选中的文本翻译成简体中文（v5.6 新增，F10）
+// 与润色刻意区分：翻译要"忠实"，不得改写语气与信息量；已是中文时原样返回，
+// 避免"中文翻中文"把原文改坏。
+const translatePrompt = `你是一个专业的中文翻译，负责把用户提供的文本翻译成简体中文。
+任务：把用户提供的文本翻译成自然、准确、通顺的简体中文。
+核心原则：
+1. 忠实原文：不增删内容、不解释、不补充背景，不改变原意、语气与立场。
+2. 通顺自然：符合中文表达习惯，避免逐字直译造成的欧化句式与生硬语序。
+3. 术语与专名：人名、地名、机构名、产品名、专业术语采用通行译法；无通行译法时保留原文，可在其后用括号补中文（如 Kubernetes（容器编排系统））。
+4. 保留格式：保持原有换行与段落划分；列表、编号、代码、公式、URL、邮箱、变量名等保持原样。
+5. 已是中文：若原文已经是中文，不要改写、不要润色，原样返回；若为繁体中文则转为简体。
+6. 无有效内容：若文本只是符号、数字或无法翻译的内容，原样返回。
+输出要求：
+- 只输出译文本身，不要添加任何说明、注释、原文对照或语言标注。
+- 不要使用代码块、引号或任何额外符号包裹输出。
+- 保持输出与输入的换行格式一致。
+示例：
+输入：The meeting has been postponed to next Monday.
+输出：会议已推迟到下周一。
+输入：Merci beaucoup, à bientôt !
+输出：非常感谢，回头见！`
 
 // ---------- 日志运行期参数（main 中由配置注入）----------
 
@@ -339,7 +365,8 @@ func logField(b []byte) string {
 
 // ---------- 智谱 API ----------
 
-func callAPI(cfg *config, prompt, text string) (string, error) {
+// kind 仅用于日志区分本次调用属于哪个功能（润色 / 翻译）
+func callAPI(cfg *config, kind, prompt, text string) (string, error) {
 	payload := map[string]any{
 		"model": cfg.model,
 		"messages": []map[string]string{
@@ -363,6 +390,7 @@ func callAPI(cfg *config, prompt, text string) (string, error) {
 
 	// ---- 调用日志：请求侧 ----
 	rawLog("---- 大模型调用开始 ----")
+	rawLog("调用类型: ", kind)
 	rawLog("请求URL: ", cfg.baseURL)
 	rawLog("请求参数: ", logField(body))
 
@@ -451,15 +479,17 @@ func doHTTP(cfg *config, req *http.Request) (*http.Response, error) {
 }
 
 // corePolish 单段润色
-func corePolish(cfg *config, text string) (string, error) {
-	return callAPI(cfg, polishPrompt, text)
+// coreText 单次调用（kind 只用于日志区分功能）
+func coreText(cfg *config, kind, prompt, text string) (string, error) {
+	return callAPI(cfg, kind, prompt, text)
 }
 
-// processPolish 对外润色入口：超长分块拼接
-func processPolish(cfg *config, text string) (string, error) {
+// segmented 通用入口：文本不超过 cfg.maxText 时一次调用；超长则切片并拼接。
+// 润色与翻译共用（两者都只是"换个提示词调用大模型"，分块策略完全一致）。
+func segmented(cfg *config, kind, prompt, text string) (string, error) {
 	runes := []rune(text)
 	if len(runes) <= cfg.maxText {
-		return corePolish(cfg, text)
+		return coreText(cfg, kind, prompt, text)
 	}
 	overlap := 30
 	var sb strings.Builder
@@ -469,11 +499,11 @@ func processPolish(cfg *config, text string) (string, error) {
 			end = len(runes)
 		}
 		chunk := string(runes[i:end])
-		content, err := corePolish(cfg, chunk)
+		content, err := coreText(cfg, kind, prompt, chunk)
 		if err != nil {
 			return "", err
 		}
-		sb.WriteString(cleanPolish(content))
+		sb.WriteString(cleanOutput(content))
 		if end == len(runes) {
 			break
 		}
@@ -481,15 +511,22 @@ func processPolish(cfg *config, text string) (string, error) {
 	return sb.String(), nil
 }
 
-// startServer 常驻本地服务：复用连接池，提供 /polish 端点
-func startServer(store *configStore) {
-	cfg := store.current() // 启动时读一次，仅用于绑定端口与建连接池
-	clientFor(cfg.timeout)
+// processPolish 润色入口
+func processPolish(cfg *config, text string) (string, error) {
+	return segmented(cfg, "润色", polishPrompt, text)
+}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/polish", func(w http.ResponseWriter, r *http.Request) {
-		// ★ 关键：每个请求都取一次当前配置（内部按文件内容指纹判是否重载）。
-		// 这样即便本进程是上一次遗留的"僵尸后端"，改了 app.ini 后下一次 F9
+// processTranslate 翻译入口：把文本翻译成简体中文（v5.6 新增，前端 F10 调用）
+func processTranslate(cfg *config, text string) (string, error) {
+	return segmented(cfg, "翻译", translatePrompt, text)
+}
+
+// textHandler 生成文本处理端点（/polish 与 /translate 共用同一套
+// 取配置→读 body→错误映射逻辑，只是处理函数不同）
+func textHandler(store *configStore, run func(*config, string) (string, error)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// ★ 每个请求都取一次当前配置（内部按文件内容指纹判是否重载）。
+		// 这样即便本进程是上一次遗留的"僵尸后端"，改了 app.ini 后下一次调用
 		// 也会立刻用上新 base_url / model / api_key，而不是进程启动时的旧值。
 		cfg := store.current()
 		if cfg == nil || cfg.apiKey == "" {
@@ -499,10 +536,11 @@ func startServer(store *configStore) {
 		body, _ := io.ReadAll(r.Body)
 		text := strings.TrimSpace(string(body))
 		if text == "" {
+			// 空文本直接返回空串（不调用大模型）：供前端做存活/连通性探针
 			io.WriteString(w, "")
 			return
 		}
-		content, err := processPolish(cfg, text)
+		content, err := run(cfg, text)
 		if err != nil {
 			io.WriteString(w, "__ERROR__"+err.Error())
 			return
@@ -512,7 +550,18 @@ func startServer(store *configStore) {
 			return
 		}
 		io.WriteString(w, content)
-	})
+	}
+}
+
+// startServer 常驻本地服务：复用连接池，提供 /polish、/translate、/shutdown
+func startServer(store *configStore) {
+	cfg := store.current() // 启动时读一次，仅用于绑定端口与建连接池
+	clientFor(cfg.timeout)
+
+	mux := http.NewServeMux()
+	// 业务端点：两者共用 textHandler（取配置、读 body、错误映射一致）
+	mux.HandleFunc("/polish", textHandler(store, processPolish))
+	mux.HandleFunc("/translate", textHandler(store, processTranslate))
 
 	// /shutdown：前端退出时调用，请本进程优雅退出。
 	// 存在的意义：后端是"分离启动"的常驻进程，不随前端退出而结束；
@@ -541,8 +590,8 @@ func startServer(store *configStore) {
 
 // ---------- 结果处理 ----------
 
-// cleanPolish 清理润色输出：去掉代码块包裹和模型误加的首尾引号
-func cleanPolish(s string) string {
+// cleanOutput 清理模型输出：去掉代码块包裹和误加的首尾引号（润色与翻译共用）
+func cleanOutput(s string) string {
 	s = strings.TrimSpace(s)
 	if strings.HasPrefix(s, "```") {
 		lines := strings.Split(s, "\n")
@@ -580,7 +629,7 @@ func main() {
 
 	// 配置经 configStore 统一提供：
 	//   · -server 模式：每个请求前检查文件是否变更，变了立即热重载（见 configStore 注释）
-	//   · -polish 模式：一次性进程，读一次即可
+	//   · -polish / -translate 模式：一次性进程，读一次即可
 	store := newConfigStore(iniPath)
 	cfg := store.current()
 
@@ -591,13 +640,25 @@ func main() {
 	}
 	rawLog(fmt.Sprintf("脚本启动 | 参数数=%d | argv=%v", len(os.Args), os.Args))
 
-	// 模式判定：check_ai.exe -polish <input.txt> <output.txt>
-	// v5.2 起错字检查（F8）已移除，CLI 仅保留润色模式
-	if len(os.Args) < 4 || os.Args[1] != "-polish" {
-		fmt.Println("用法: check_ai.exe -polish <input.txt> <output.txt>")
-		fmt.Println("  润色语句: check_ai.exe -polish in.txt out.txt")
+	// 模式判定：check_ai.exe -polish    <input.txt> <output.txt>
+	//           check_ai.exe -translate <input.txt> <output.txt>
+	// v5.2 起错字检查（F8）已移除，CLI 只保留"润色"与"翻译"两种一次性调用
+	mode := ""
+	if len(os.Args) >= 2 {
+		mode = os.Args[1]
+	}
+	if len(os.Args) < 4 || (mode != "-polish" && mode != "-translate") {
+		fmt.Println("用法: check_ai.exe -polish    <input.txt> <output.txt>   # 润色")
+		fmt.Println("      check_ai.exe -translate <input.txt> <output.txt>   # 翻译成中文")
+		fmt.Println("      check_ai.exe -server                              # 常驻本地服务")
 		rawLog(fmt.Sprintf("退出: 参数不合法，argv=%v", os.Args))
 		return
+	}
+	run := processPolish
+	verb := "润色"
+	if mode == "-translate" {
+		run = processTranslate
+		verb = "翻译"
 	}
 	inPath, outPath := os.Args[2], os.Args[3]
 
@@ -613,8 +674,8 @@ func main() {
 		return
 	}
 
-	rawLog(fmt.Sprintf("开始润色 | 模型=%s | base_url=%s | 文本长度=%d",
-		cfg.model, cfg.baseURL, len(text)))
+	rawLog(fmt.Sprintf("开始%s | 模型=%s | base_url=%s | 文本长度=%d",
+		verb, cfg.model, cfg.baseURL, len(text)))
 
 	// 未配置 Key
 	if cfg == nil || cfg.apiKey == "" {
@@ -626,7 +687,7 @@ func main() {
 	// 调用云端 AI（超长自动切片）
 	rawLog(fmt.Sprintf("发送请求 | text长度=%d | model=%s | url=%s", len(text), cfg.model, cfg.baseURL))
 	start := time.Now()
-	content, err := processPolish(cfg, text)
+	content, err := run(cfg, text)
 	if err != nil {
 		elapsed := time.Since(start).Seconds()
 		rawLog(fmt.Sprintf("调用失败 | 耗时=%.2fs | %v", elapsed, err))
@@ -635,13 +696,13 @@ func main() {
 	}
 	elapsed := time.Since(start).Seconds()
 
-	// 写润色后文本（完整响应体已由 callAPI 记入日志，此处不再重复记录预览）
-	polished := cleanPolish(content)
-	rawLog(fmt.Sprintf("收到响应 | 耗时=%.2fs | 润色后长度=%d", elapsed, len(polished)))
-	if polished == "" {
-		rawLog("解析结果 | 润色文本为空")
+	// 写结果文本（完整响应体已由 callAPI 记入日志，此处不再重复记录预览）
+	result := cleanOutput(content)
+	rawLog(fmt.Sprintf("收到响应 | 耗时=%.2fs | %s后长度=%d", elapsed, verb, len(result)))
+	if result == "" {
+		rawLog(fmt.Sprintf("解析结果 | %s文本为空", verb))
 		_ = os.WriteFile(outPath, []byte("__ERROR__空响应\n"), 0644)
 		return
 	}
-	_ = os.WriteFile(outPath, []byte(polished), 0644)
+	_ = os.WriteFile(outPath, []byte(result), 0644)
 }

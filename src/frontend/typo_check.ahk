@@ -14,15 +14,21 @@ if !A_IsAdmin && A_Args.Length = 0 {
 }
 
 ; =============================================================
-; 文本润色工具  v5.4（Go 版 · 免 Python 环境）
+; 文本润色 · 翻译工具  v5.6（Go 版 · 免 Python 环境）
 ; 用法：在任意可编辑的输入框（微信聊天框、网页文本框、
 ;       记事本、代码编辑器等）打好字后：
-;       方式一（只润色一段）：先用鼠标/键盘选中要润色的文字，再按 F9
+;       【F9 润色】
+;       方式一（只润色一段）：先选中要润色的文字，再按 F9
 ;             → 只润色并替换选中的这一段，选区之外的文字完全不动
 ;       方式二（润色全部）：不选中任何文字，直接按 F9
 ;             → 润色整个输入框的内容并整体替换
 ;       两种方式都是弹窗预览（可编辑微调），点"替换原文"才回填
-;       热键可在 config\app.ini 的 [hotkey] 段修改（polish_key）
+;       【F10 翻译成中文】
+;       选中要翻译的文字，按 F10 → 把这段翻译成中文并弹窗展示
+;       不选中则把整个输入框的内容当原文（窗口里会写明翻的是哪一段）
+;       译文窗口只读，不影响原文；需要回填点「复制译文」再自行粘贴
+;       热键可在 config\app.ini 的 [hotkey] 段修改
+;         polish_key=润色热键（默认 F9）／translate_key=翻译热键（默认 F10）
 ; 说明：本工具不修改任何程序，仅模拟复制/粘贴，安全无风险
 ;
 ; v5.0 变更：
@@ -65,6 +71,13 @@ if !A_IsAdmin && A_Args.Length = 0 {
 ;   1. 程序名收敛到唯一来源 AppName（脚本顶部 = "mosq-ai-fix"），托盘悬停提示、
 ;      弹窗标题、预览窗标题、通知标题全部取它；启动器 exe 的版本资源（app.rc）
 ;      同步写入同一个名字，Windows 的任务管理器/启动项/文件属性也随之一致
+; v5.6 变更（新增"翻译成中文"，默认 F10）：
+;   1. 新热键 translate_key（默认 F10）：选中文字后按它，把内容翻译成中文并
+;      弹窗展示原文 + 译文；译文窗口只读，配「复制译文」按钮，**不提供替换原文**，
+;      避免误覆盖（翻译的用途是看懂，不是改写）
+;   2. 与润色共用选区判定逻辑 ReadInputText()：有选区翻选区，无选区翻整个输入框
+;   3. 连通性自检：自检会探测 /translate 端点（POST 空文本，不消耗额度）
+;   4. 两热键分别注册：某一个被占用时不影响另一个，并明确指出冲突项
 ; =============================================================
 
 ; ---------------- 程序显示名（唯一来源，改这里即可全局生效）----------------
@@ -84,7 +97,8 @@ global AppName := "mosq-ai-fix"
 ; 因此 BaseDir 恒为 A_ScriptDir 的上一级，不再区分源码版/编译版
 global BaseDir := A_ScriptDir "\.."           ; 部署根（runtime 的上一级）
 global CfgIni := BaseDir "\config\app.ini"    ; 部署参数文件
-global PolishKey := LoadPolishHotkey() ; [hotkey] polish_key 读取，失败回退 F9
+global PolishKey := LoadHotkey("polish_key", "F9")       ; [hotkey] polish_key，失败回退 F9
+global TranslateKey := LoadHotkey("translate_key", "F10") ; [hotkey] translate_key，失败回退 F10
 global SelectMode := LoadSelectMode()  ; [ui] select_mode 读取，缺省 auto（自动判别选区/全选）
 global ServerPort := "18765"           ; 常驻服务端口（与 check_ai.go 默认一致，可被 [server] port 覆盖）
 try {
@@ -121,11 +135,12 @@ if A_Args.Length > 0 && A_Args[1] = "-selftest" {
 }
 
 RunSelfTest() {
-    global SelfTestReport, SelectMode, PolishKey, AppName
+    global SelfTestReport, SelectMode, PolishKey, TranslateKey, AppName
     rep := ""
     rep .= "程序显示名: " AppName "`n"
     rep .= "AI 校对: " (IsAIEnabled() ? "已启用" : "未启用（编辑 config\app.ini 配置 API Key 后启用）") "`n"
     rep .= "润色热键: " PolishKey "（改 config\app.ini 的 [hotkey] polish_key 后重启生效）`n"
+    rep .= "翻译热键: " TranslateKey "（改 config\app.ini 的 [hotkey] translate_key 后重启生效）`n"
     rep .= "润色模式: " (SelectMode = "all" ? "总是全选（[ui] select_mode=all）" : "自动判别选区/全选（[ui] select_mode=auto）") "`n"
     rep .= "右下角提醒: " (TrayTipEnabled() ? "开启（[ui] tray_tip=true）" : "关闭（[ui] tray_tip=false）") "`n"
     ; 润色自检：结果不稳定，只验证调用成功且输出非空
@@ -133,6 +148,8 @@ RunSelfTest() {
     rep .= "润色状态: " p[1] "，结果长度 " StrLen(p[2]) " 字`n"
     if p[2] != ""
         rep .= "  " p[2] "`n"
+    ; 翻译只探测端点是否就绪（POST 空文本，后端不调用大模型、不消耗额度）
+    rep .= "翻译端点: " (EndpointReady("translate") ? "可用（/translate 已就绪）" : "不可用（后端过旧或未启动，请重新构建部署）") "`n"
 
     ; 必须写文件：GUI 子系统的 stdout 句柄在部分宿主下不可用（如 PowerShell 的 & 调用），
     ; 只写 stdout 会让自检结果不可见、也无法被构建脚本判定。
@@ -172,15 +189,18 @@ IsEditableFocused() {
 }
 
 ; ---------------- 触发热键读取 ----------------
-; 从 config\app.ini 的 [hotkey] polish_key 读取润色热键（如 F9、^F9、!F9），读取失败/为空回退 F9
-LoadPolishHotkey() {
+; 从 config\app.ini 的 [hotkey] 段读取热键（如 F9、F10、^F9、!F9）；
+; 读取失败或为空时回退到 fallback。
+;   polish_key    润色热键，默认 F9
+;   translate_key 翻译成中文热键，默认 F10（v5.6 新增）
+LoadHotkey(keyName, fallback) {
     global CfgIni
     try {
-        k := Trim(IniRead(CfgIni, "hotkey", "polish_key"))
+        k := Trim(IniRead(CfgIni, "hotkey", keyName))
         if k != ""
             return k
     }
-    return "F9"
+    return fallback
 }
 
 ; ---------------- 润色模式偏好（v5.4）----------------
@@ -339,24 +359,25 @@ BytesToUtf8(body) {
     return stream.ReadText()
 }
 
-; ---------------- 调用本地常驻服务做语句润色（v5.0）----------------
-; 返回 [status, polishedText]
+; ---------------- 调用本地常驻服务（v5.0；v5.6 起润色/翻译共用）----------------
+; 返回 [status, result]
 ;   status : "ok" 正常 | "no_key" 未配置 Key | "no_python" 未能启动程序 | "error" 调用失败
-;   text   : 润色后的整段文本（ok 时）
-RunPolish(text) {
+;   result : 处理后的整段文本（ok 时）
+; endpoint: "polish" 润色 | "translate" 翻译成中文
+RunEndpoint(endpoint, text) {
     ; 1. 确保常驻服务已启动
     if !EnsureServer()
         return ["no_python", ""]
 
-    ; 2. 调用 /polish；若服务异常则尝试重启一次再调用
+    ; 2. 调用端点；若服务异常则尝试重启一次再调用
     try {
-        content := HttpPost("polish", text)
+        content := HttpPost(endpoint, text)
     } catch {
         if !EnsureServer() {
             return ["error", ""]
         }
         try {
-            content := HttpPost("polish", text)
+            content := HttpPost(endpoint, text)
         } catch {
             return ["error", ""]
         }
@@ -371,15 +392,47 @@ RunPolish(text) {
     return ["ok", content]
 }
 
-; ---------------- 注册热键 ----------------
-hotkeyErr := ""
+; 润色（F9）
+RunPolish(text) {
+    return RunEndpoint("polish", text)
+}
+
+; 翻译成中文（F10）
+RunTranslate(text) {
+    return RunEndpoint("translate", text)
+}
+
+; 端点连通性探测：POST 空文本（后端对空文本直接返回空串，不会调用大模型，
+; 因此不消耗额度）。用于自检确认 /translate 之类的端点确实存在（否则会 404 抛错）。
+EndpointReady(endpoint) {
+    try {
+        HttpPost(endpoint, "")
+        return true
+    } catch {
+        return false
+    }
+}
+
+; ---------------- 注册热键（v5.6：润色 + 翻译两个）----------------
+; 两个热键各自独立注册：某一个被别的程序占用时，不影响另一个继续可用，
+; 但会明确告知是哪一个冲突、怎么改，避免"按了没反应"的困惑。
+hotkeyErrs := ""
+if PolishKey = TranslateKey {
+    MsgBox("配置错误：[hotkey] 段的 polish_key 与 translate_key 不能相同（当前都是 " PolishKey "）。请用记事本打开 config\app.ini 改掉其中一个，保存后重新双击「mosq-ai-fix.exe」。", AppName, "Iconi")
+    ExitApp()
+}
 try {
     Hotkey(PolishKey, PolishText)
 } catch {
-    hotkeyErr := PolishKey
+    hotkeyErrs .= PolishKey "（润色 polish_key） "
 }
-if hotkeyErr != "" {
-    MsgBox("热键 " hotkeyErr " 已被其他程序占用。请用记事本打开 config\app.ini，修改 [hotkey] 段的 polish_key 为其他按键，保存后重新双击「mosq-ai-fix.exe」。`n`n格式示例：F9、^F9(Ctrl+F9)、!F9(Alt+F9)、+F9(Shift+F9)", AppName, "Iconi")
+try {
+    Hotkey(TranslateKey, TranslateText)
+} catch {
+    hotkeyErrs .= TranslateKey "（翻译 translate_key） "
+}
+if hotkeyErrs != "" {
+    MsgBox("以下热键已被其他程序占用：" Trim(hotkeyErrs) "`n`n请用记事本打开 config\app.ini，修改 [hotkey] 段里对应的按键，保存后重新双击「mosq-ai-fix.exe」。`n`n格式示例：F9、F10、^F9(Ctrl+F9)、!F9(Alt+F9)、+F9(Shift+F9)", AppName, "Iconi")
     ExitApp()
 }
 
@@ -388,9 +441,9 @@ if hotkeyErr != "" {
 StopLeftoverServer()
 
 if IsAIEnabled()
-    TrayTip("语句润色已运行（AI 已开启）｜任意输入框按 " PolishKey " 润色", AppName, 3)
+    TrayTip("已运行（AI 已开启）｜" PolishKey " 润色 · " TranslateKey " 翻译成中文", AppName, 3)
 else
-    TrayTip("语句润色已运行 · AI 未启用：编辑 config\app.ini 填入 API Key 后重启", AppName, 5)
+    TrayTip("已运行 · AI 未启用：编辑 config\app.ini 填入 API Key 后重启", AppName, 5)
 
 ; ---------------- 读取输入框文本并判别润色模式（v5.4）----------------
 ; 返回 [mode, text]
@@ -488,6 +541,99 @@ PolishText(*) {
 
     ; 4. 弹窗预览润色结果（可编辑微调），确认后按原模式替换
     ShowPolishGui(text, p[2], WinGetID("A"), mode)
+}
+
+; ---------------- 主流程：翻译成中文（v5.6，默认 F10）----------------
+; 与润色共用 ReadInputText() 的选区判定：选中了文字就翻这一段，
+; 没选中就把整个输入框的内容当原文（窗口里会写明翻的是哪一段）。
+; 与润色的关键区别：翻译**只展示、不改动原文**——译文窗口是只读的，
+; 另配一个「复制译文」按钮，避免误操作把原文覆盖掉。
+TranslateText(*) {
+    global TranslateKey
+    if !IsEditableFocused() {
+        MsgBox("当前焦点不在文本输入框里，请先点击要翻译的输入框（微信聊天框、网页文本框、记事本等均可），再按 " TranslateKey, AppName, "Iconi")
+        return
+    }
+
+    ; 1. 读取文本并判定模式：有选区读选区，无选区读全文
+    r := ReadInputText()
+    mode := r[1]
+    text := r[2]
+
+    if mode = "none" {
+        ShowAutoCloseTip("没读到文字", "请先选中要翻译的文字，再按 " . TranslateKey, 1000)
+        return
+    }
+    if Trim(text) = "" {
+        ShowAutoCloseTip("没有可翻译的文字", "先选中要翻译的文字，再按 " . TranslateKey, 1000)
+        return
+    }
+
+    ; 2. 检查 AI 配置
+    if !IsAIEnabled() {
+        MsgBox("AI 未启用。请用记事本打开 config\app.ini，填入云端 API Key 并设 enabled=true", AppName, "Iconi")
+        return
+    }
+
+    ; 3. 调用云端 AI 翻译（约 1-5 秒，鼠标旁会显示"正在翻译"提示）
+    ToolTip("正在翻译，请稍候…")
+    p := RunTranslate(text)
+    ToolTip()
+
+    if p[1] = "no_key" {
+        MsgBox("未检测到 API Key。请用记事本打开 config\app.ini 填入", AppName, "Iconi")
+        return
+    }
+    if p[1] = "no_python" {
+        MsgBox("未能启动后端程序 check_ai.exe。请确认工具目录里有 check_ai.exe（Go 编译，无需安装 Python），且未被杀毒软件拦截；仍不行请重新解压/复制整个工具目录。", AppName, "Iconi")
+        return
+    }
+    if p[1] = "error" {
+        MsgBox("翻译失败，请检查网络连接后重试；如超时可把 config\app.ini 里的 timeout 调大", AppName, "Iconi")
+        return
+    }
+
+    ; 4. 展示译文（只读，不影响原文）
+    ShowTranslateGui(text, p[2], mode)
+}
+
+; ---------------- 译文窗口（v5.6）----------------
+; 上下两块：上为原文（只读、灰色，便于对照），下为中文译文（只读、可选中复制）。
+; 刻意**不提供"替换原文"**：翻译的用途是"看懂"，误覆盖原文的代价太高；
+; 需要回填时点「复制译文」再自行粘贴即可。
+ShowTranslateGui(orig, translated, mode) {
+    scopeText := (mode = "sel") ? "已选中的 " StrLen(orig) " 字" : "整个输入框（未检测到选区）"
+
+    myGui := Gui("+AlwaysOnTop", AppName " · 翻译成中文")
+    myGui.SetFont("s10", "Microsoft YaHei")
+
+    myGui.SetFont("s9 norm")
+    myGui.Add("Text", "w620 c6B7280", "原文（" scopeText "）")
+    myGui.SetFont("s10")
+    myGui.Add("Edit", "w620 h90 ReadOnly", orig)
+
+    myGui.SetFont("s9 norm")
+    myGui.Add("Text", "w620 c6B7280", "中文译文（可选中复制；如需回填原文，点「复制译文」后自行粘贴）")
+    myGui.SetFont("s10")
+    trans := myGui.Add("Edit", "w620 h220 ReadOnly", translated)
+
+    btnCopy := myGui.Add("Button", "w130 h32 Default", "复制译文")
+    btnClose := myGui.Add("Button", "x+12 w100 h32", "关闭")
+    btnCopy.OnEvent("Click", (*) => CopyTranslation(myGui, trans))
+    btnClose.OnEvent("Click", (*) => myGui.Destroy())
+    myGui.Show()
+}
+
+; 把译文写入剪贴板（保留原有剪贴板内容不做恢复：用户点"复制"就是要用它）
+CopyTranslation(myGui, transCtrl) {
+    text := transCtrl.Text
+    if Trim(text) = "" {
+        ShowAutoCloseTip("译文为空", "没有可复制的内容", 1000)
+        return
+    }
+    A_Clipboard := text
+    myGui.Destroy()
+    TrayTip("译文已复制到剪贴板", AppName, 3)
 }
 
 ; ---------------- 润色结果弹窗（v5.0；v5.4 起标注模式）----------------

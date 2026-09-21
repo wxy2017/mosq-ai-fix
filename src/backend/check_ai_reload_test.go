@@ -192,9 +192,15 @@ func waitServerReady(t *testing.T, base string) {
 
 func postPolish(t *testing.T, base, text string) string {
 	t.Helper()
-	resp, err := http.Post(base+"/polish", "text/plain", strings.NewReader(text))
+	return postText(t, base+"/polish", text)
+}
+
+// postText 向任意文本端点 POST 并返回响应体
+func postText(t *testing.T, endpointURL, text string) string {
+	t.Helper()
+	resp, err := http.Post(endpointURL, "text/plain", strings.NewReader(text))
 	if err != nil {
-		t.Fatalf("请求 /polish 失败: %v", err)
+		t.Fatalf("请求 %s 失败: %v", endpointURL, err)
 	}
 	defer resp.Body.Close()
 	b, _ := io.ReadAll(resp.Body)
