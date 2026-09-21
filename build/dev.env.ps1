@@ -20,9 +20,10 @@ $WindresExe = 'D:\evn\w64devkit-1.22.0\w64devkit\bin\windres.exe'
 $AhkExe = Join-Path $RepoRoot 'tools\ahk\AutoHotkey64.exe'
 
 # ---- 构建选项 ----
-# 版本号仅用于构建日志展示；真正的缓存失效标记是
-# src\backend\check_ai.go 里的 promptVersion（改提示词时必须同步改它）
-$Version = '5.3'
+# 版本号用于构建日志展示，并与启动器 exe 的版本资源
+# （src\launcher\app.rc 的 FILEVERSION / ProductVersion）保持一致；
+# 注意 app.rc 里的版本号需手动同步，改动版本时两处一起改。
+$Version = '5.5'
 
 # $true = 加 -ldflags "-s -w" 精简体积（约减 25%）；$false = 保留符号便于调试
 $StripSymbols = $false

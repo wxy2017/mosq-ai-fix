@@ -14,11 +14,14 @@ if !A_IsAdmin && A_Args.Length = 0 {
 }
 
 ; =============================================================
-; 文本润色工具  v5.2（Go 版 · 免 Python 环境）
+; 文本润色工具  v5.4（Go 版 · 免 Python 环境）
 ; 用法：在任意可编辑的输入框（微信聊天框、网页文本框、
 ;       记事本、代码编辑器等）打好字后：
-;         按 F9 润色当前语句，改写得更得体、通顺、易理解，
-;             弹窗预览（可编辑微调），点"替换原文"回填
+;       方式一（只润色一段）：先用鼠标/键盘选中要润色的文字，再按 F9
+;             → 只润色并替换选中的这一段，选区之外的文字完全不动
+;       方式二（润色全部）：不选中任何文字，直接按 F9
+;             → 润色整个输入框的内容并整体替换
+;       两种方式都是弹窗预览（可编辑微调），点"替换原文"才回填
 ;       热键可在 config\app.ini 的 [hotkey] 段修改（polish_key）
 ; 说明：本工具不修改任何程序，仅模拟复制/粘贴，安全无风险
 ;
@@ -41,7 +44,39 @@ if !A_IsAdmin && A_Args.Length = 0 {
 ;  2. 移除磁盘缓存（原 <部署根>\.cache），每次润色均直连云端 API：
 ;     重复调用不再瞬时、同句结果措辞可能不同，但消除了"改提示词忘升级
 ;     版本号导致一直吃旧结果"的隐患，磁盘上也不再有残留
+; v5.4 变更（新增"手动选区润色"）：
+;  1. 按热键时自动判别两种模式并共存：
+;       · 用户已手动选中一段文字 → 选区模式：只润色该段，回填时只覆盖该段，
+;         选区之外的其余内容保持完全不变
+;       · 用户未选中任何文字 → 全选模式：沿用 v5.3 行为，润色整个输入框
+;  2. 判别方式：先不按 ^a，直接发 ^c 试探。复制操作不会清除选区，因此
+;     剪贴板能拿到非空文本即说明"当前存在选区"；拿不到则退回全选读取。
+;     好处是选区模式下定位于原选区的信息被完整保留，回填只需 ^v。
+;  3. 预览窗标题与提示行会标明当前处于哪种模式，避免误判时用户无感
+;  4. [ui] select_mode 可强制指定：auto（默认，自动判别）/ all（总是全选）
+;     —— 用于 VSCode 这类"无选区时按 Ctrl+C 会复制整行"的编辑器
+; v5.5 变更（修复"改配置不生效"）：
+;   1. 后端 -server 是分离启动的常驻进程，关掉 mosq-ai-fix.exe / 退出托盘
+;      都不会结束它；而它一直用"启动那一刻"的配置 → 改完 app.ini 重启工具
+;      仍会复用旧进程，日志里还是旧接口地址
+;   2. 修复：OnExit 时请后端退出并按 PID 兜底回收；启动时先清掉遗留后端，
+;      确保每次运行都是全新进程。后端侧另有配置热重载做双保险
+; v5.5 变更（之二：统一程序显示名）：
+;   1. 程序名收敛到唯一来源 AppName（脚本顶部 = "mosq-ai-fix"），托盘悬停提示、
+;      弹窗标题、预览窗标题、通知标题全部取它；启动器 exe 的版本资源（app.rc）
+;      同步写入同一个名字，Windows 的任务管理器/启动项/文件属性也随之一致
 ; =============================================================
+
+; ---------------- 程序显示名（唯一来源，改这里即可全局生效）----------------
+; 本工具在界面上出现的"程序名"统一取这一处：托盘悬停提示、各弹窗标题、
+; 预览窗标题、通知标题、自检报告；Windows 侧（任务管理器/启动项/文件属性）
+; 读的则是启动器 exe 的版本资源，见 src\launcher\app.rc 的
+; FileDescription/ProductName —— 两处必须保持同一个名字，改名字要一起改。
+; 当前取值刻意与启动器文件名保持一致（mosq-ai-fix），这样托盘、界面、
+; 任务管理器、exe 文件名四者呈现同一名称，用户看到的"程序"只有一个名字。
+; 说明：脚本自身的文件名仍是 typo_check.ahk（磁盘上的真实文件），
+; 那属于实现细节，不作为对外显示名。
+global AppName := "mosq-ai-fix"
 
 ; 目录结构（v5.3）：脚本固定部署在 <部署根>\runtime\，其上一级即部署根
 ;   <部署根>\config\app.ini   部署参数（用户可改）
@@ -50,6 +85,7 @@ if !A_IsAdmin && A_Args.Length = 0 {
 global BaseDir := A_ScriptDir "\.."           ; 部署根（runtime 的上一级）
 global CfgIni := BaseDir "\config\app.ini"    ; 部署参数文件
 global PolishKey := LoadPolishHotkey() ; [hotkey] polish_key 读取，失败回退 F9
+global SelectMode := LoadSelectMode()  ; [ui] select_mode 读取，缺省 auto（自动判别选区/全选）
 global ServerPort := "18765"           ; 常驻服务端口（与 check_ai.go 默认一致，可被 [server] port 覆盖）
 try {
     p := Trim(IniRead(CfgIni, "server", "port"))
@@ -57,11 +93,20 @@ try {
         ServerPort := p
 } catch {
 }
+global ServerPid := 0                  ; 本前端拉起的后端进程号（退出时用它回收）
+
+; 退出时回收后端。放在最靠前的位置，连自检模式（-selftest）退出也能生效，
+; 否则自检拉起的常驻服务会一直留在后台、占着端口并锁住 check_ai.exe。
+OnExit(ShutdownBackend)
 
 ; 托盘图标：同目录的 icon.ico（源码版与 Ahk2Exe 编译版路径一致）
 icoFile := A_ScriptDir "\icon.ico"
 if FileExist(icoFile)
     TraySetIcon(icoFile)
+
+; 托盘悬停提示（就是截图里那行名字）。不显式设置时 AHK 会用脚本文件名兜底，
+; 这里统一为 AppName，确保托盘与弹窗标题、Windows 程序名完全一致。
+A_IconTip := AppName
 
 ; ---------------- 自检模式 ----------------
 ; 调用：runtime\AutoHotkey64.exe runtime\typo_check.ahk -selftest
@@ -76,10 +121,12 @@ if A_Args.Length > 0 && A_Args[1] = "-selftest" {
 }
 
 RunSelfTest() {
-    global SelfTestReport
+    global SelfTestReport, SelectMode, PolishKey, AppName
     rep := ""
+    rep .= "程序显示名: " AppName "`n"
     rep .= "AI 校对: " (IsAIEnabled() ? "已启用" : "未启用（编辑 config\app.ini 配置 API Key 后启用）") "`n"
     rep .= "润色热键: " PolishKey "（改 config\app.ini 的 [hotkey] polish_key 后重启生效）`n"
+    rep .= "润色模式: " (SelectMode = "all" ? "总是全选（[ui] select_mode=all）" : "自动判别选区/全选（[ui] select_mode=auto）") "`n"
     rep .= "右下角提醒: " (TrayTipEnabled() ? "开启（[ui] tray_tip=true）" : "关闭（[ui] tray_tip=false）") "`n"
     ; 润色自检：结果不稳定，只验证调用成功且输出非空
     p := RunPolish("我今天真的挺想去的，但是时间上面好像有点不太够。")
@@ -136,6 +183,23 @@ LoadPolishHotkey() {
     return "F9"
 }
 
+; ---------------- 润色模式偏好（v5.4）----------------
+; 从 config\app.ini 的 [ui] select_mode 读取按热键时的模式判别策略：
+;   auto（默认）=自动判别：检测到选区则只润色选区，否则润色整个输入框
+;   all         =总是全选整个输入框（v5.3 及以前的旧行为）
+; 何时需要改：在 VSCode 等"光标处无选中时按 Ctrl+C 会复制整行"的编辑器里，
+; 自动判别可能把"整行"误判成选区；此时设为 all 即可恢复"永远润色全文"。
+; 取值非法或读取失败一律回退 auto。
+LoadSelectMode() {
+    global CfgIni
+    try {
+        v := Trim(IniRead(CfgIni, "ui", "select_mode"))
+        if v = "all"
+            return "all"
+    }
+    return "auto"
+}
+
 ; ---------------- 右下角提醒开关 ----------------
 ; 从 config\app.ini 的 [ui] tray_tip 读取：true=一键修正后在右下角弹
 ; "已修正并回填"提醒；false=不弹（默认，读取失败也视为 false）
@@ -170,19 +234,60 @@ IsAIEnabled() {
 
 ; 确保本地润色服务已启动：已运行则直接返回；未运行则拉起 check_ai.exe -server 并等待就绪
 EnsureServer() {
-    global BaseDir, ServerPort
+    global BaseDir, ServerPort, ServerPid
     if IsServerUp()
         return true
     exePath := A_ScriptDir "\check_ai.exe"
     if !FileExist(exePath)
         return false
-    Run('"' exePath '" -server', BaseDir, "Hide")
+    ServerPid := Run('"' exePath '" -server', BaseDir, "Hide")   ; 记下 PID，退出时回收
     loop 60 {                     ; 最多等 6 秒让它监听端口
         Sleep(100)
         if IsServerUp()
             return true
     }
     return false
+}
+
+; ---------------- 后端进程回收（v5.5）----------------
+; 后端由前端以 Run(..., "Hide") **分离**启动，并非前端的子进程，因此
+; "关闭 mosq-ai-fix.exe" 或"从托盘退出"都不会让它结束。历史上它就长期驻留，
+; 并始终使用**自己启动那一刻**读到的配置，于是出现：
+;   关闭工具 → 改 app.ini 换接口地址 → 重新启动 → 前端探测到端口有人应答
+;   就直接复用这个旧进程 → 日志里仍是旧地址。
+; 这里两道保险：
+;   ① ShutdownBackend（OnExit 注册）：退出时请后端自己退出，再按 PID 兜底强杀
+;   ② StopLeftoverServer（启动时调用）：先清掉任何遗留后端，保证本次是全新进程
+;      （顺带解决"旧进程锁住 check_ai.exe 导致无法重新构建/升级"）
+ShutdownBackend(*) {
+    global ServerPid
+    PostShutdown()
+    ; 按 PID 强杀前先确认该 PID 仍是 check_ai.exe，避免 PID 被系统复用后误杀
+    if ServerPid && ProcessExist(ServerPid) {
+        try {
+            if ProcessGetName(ServerPid) = "check_ai.exe"
+                ProcessClose(ServerPid)
+        }
+    }
+    ServerPid := 0
+}
+
+; 启动时清掉遗留后端（若本来没在跑，POST 会被拒绝，静默忽略即可）
+StopLeftoverServer() {
+    PostShutdown()
+    Sleep(250)      ; 留一点时间让它释放端口
+}
+
+; 请后端优雅退出：POST /shutdown（失败静默 —— 服务没在跑属正常情况）
+PostShutdown() {
+    global ServerPort
+    try {
+        http := ComObject("WinHttp.WinHttpRequest.5.1")
+        http.Open("POST", "http://127.0.0.1:" ServerPort "/shutdown", false)
+        http.SetTimeouts(400, 400, 600, 600)
+        http.Send("")
+    } catch {
+    }
 }
 
 ; 探测服务是否就绪：向 /polish 发空请求，期望 200（空文本服务返回空串）
@@ -274,39 +379,84 @@ try {
     hotkeyErr := PolishKey
 }
 if hotkeyErr != "" {
-    MsgBox("热键 " hotkeyErr " 已被其他程序占用。请用记事本打开 config\app.ini，修改 [hotkey] 段的 polish_key 为其他按键，保存后重新双击「mosq-ai-fix.exe」。`n`n格式示例：F9、^F9(Ctrl+F9)、!F9(Alt+F9)、+F9(Shift+F9)", "语句润色", "Iconi")
+    MsgBox("热键 " hotkeyErr " 已被其他程序占用。请用记事本打开 config\app.ini，修改 [hotkey] 段的 polish_key 为其他按键，保存后重新双击「mosq-ai-fix.exe」。`n`n格式示例：F9、^F9(Ctrl+F9)、!F9(Alt+F9)、+F9(Shift+F9)", AppName, "Iconi")
     ExitApp()
 }
 
-if IsAIEnabled()
-    TrayTip("语句润色已运行（AI 已开启）", "任意输入框按 " PolishKey " 润色语句", 3)
-else
-    TrayTip("语句润色已运行", "AI 未启用：编辑 config\app.ini 填入 API Key 后重启", 5)
+; 启动时先清掉上一次残留的后端进程（详见 ShutdownBackend 注释）：
+; 保证本次运行使用全新进程 —— 新配置、新二进制，绝不复用旧进程内的旧配置。
+StopLeftoverServer()
 
-; ---------------- 主流程：语句润色（v5.0，默认 F9）----------------
-; 读取文本：默认全选整个输入框内容
-PolishText(*) {
-    global PolishKey
-    ; 通用模式：任意可编辑输入框都能润色（微信/浏览器/记事本/编辑器等）
-    if !IsEditableFocused() {
-        MsgBox("当前焦点不在文本输入框里，请先点击要润色的输入框（微信聊天框、网页文本框、记事本等均可），再按 " PolishKey, "语句润色", "Iconi")
-        return
+if IsAIEnabled()
+    TrayTip("语句润色已运行（AI 已开启）｜任意输入框按 " PolishKey " 润色", AppName, 3)
+else
+    TrayTip("语句润色已运行 · AI 未启用：编辑 config\app.ini 填入 API Key 后重启", AppName, 5)
+
+; ---------------- 读取输入框文本并判别润色模式（v5.4）----------------
+; 返回 [mode, text]
+;   mode = "sel"  手动选区模式：只润色 text（= 用户选中的那段文字）
+;   mode = "all"  全选模式：text = 整个输入框的内容
+;   mode = "none" 没读到任何文字
+;
+; 判别原理（两种模式共存的关键）：
+;   ① 先"试探性复制"：不按 ^a，直接 Send("^c")。
+;      · 有选区 → 剪贴板拿到选区文本 → 判定 sel；
+;      · 无选区 → 该应用不会往剪贴板写任何东西，ClipWait 超时 → 判定 all。
+;   ② 关键前提：Ctrl+C 只复制、不清除选区。所以 sel 分支结束后，
+;      目标输入框里的那段选区依然完好，回填时直接 ^v 就能"只覆盖这一段"，
+;      无需知道选区的起止偏移量。若这里改成先 ^a 再判断，选区会被摧毁且
+;      无法复原（任意应用里都拿不到偏移量），因此顺序不可颠倒。
+;   ③ 之后才按 ^a 读全文——这一步只发生在 all 分支（回到 v5.3 旧行为）。
+ReadInputText() {
+    global SelectMode
+    saved := ClipboardAll()
+
+    ; ① 试探选区（select_mode=all 时跳过，直接走全选）
+    if SelectMode = "auto" {
+        A_Clipboard := ""
+        Send("^c")
+        if ClipWait(0.5) {
+            sel := A_Clipboard
+            if Trim(sel) != "" {
+                A_Clipboard := saved
+                return ["sel", sel]
+            }
+        }
     }
 
-    ; 1. 保存剪贴板，读取输入框全部内容（默认全选）
-    saved := ClipboardAll()
+    ; ② 未检测到选区 → 全选读取整个输入框
     A_Clipboard := ""
     Send("^a")
     Sleep(80)
     Send("^c")
     if !ClipWait(0.8) {
         A_Clipboard := saved
-        ShowAutoCloseTip("没读到文字", "请先点击输入框，再按 " . PolishKey, 1000)
-        return
+        return ["none", ""]
     }
     text := A_Clipboard
     A_Clipboard := saved
+    return ["all", text]
+}
 
+; ---------------- 主流程：语句润色（v5.0，默认 F9）----------------
+; v5.4 起自动区分"手动选区"与"自动全选"两种模式，见 ReadInputText()
+PolishText(*) {
+    global PolishKey
+    ; 通用模式：任意可编辑输入框都能润色（微信/浏览器/记事本/编辑器等）
+    if !IsEditableFocused() {
+        MsgBox("当前焦点不在文本输入框里，请先点击要润色的输入框（微信聊天框、网页文本框、记事本等均可），再按 " PolishKey, AppName, "Iconi")
+        return
+    }
+
+    ; 1. 读取文本并判定模式：有选区读选区，无选区读全文
+    r := ReadInputText()
+    mode := r[1]
+    text := r[2]
+
+    if mode = "none" {
+        ShowAutoCloseTip("没读到文字", "请先点击输入框，再按 " . PolishKey, 1000)
+        return
+    }
     if Trim(text) = "" {
         ShowAutoCloseTip("没有可润色的文字", "先在输入框里输入内容，再按 " . PolishKey, 1000)
         return
@@ -314,7 +464,7 @@ PolishText(*) {
 
     ; 2. 检查 AI 配置
     if !IsAIEnabled() {
-        MsgBox("AI 校对未启用。请用记事本打开 config\app.ini，填入云端 API Key 并设 enabled=true", "语句润色", "Iconi")
+        MsgBox("AI 校对未启用。请用记事本打开 config\app.ini，填入云端 API Key 并设 enabled=true", AppName, "Iconi")
         return
     }
 
@@ -324,42 +474,53 @@ PolishText(*) {
     ToolTip()
 
     if p[1] = "no_key" {
-        MsgBox("未检测到 API Key。请用记事本打开 config\app.ini 填入", "语句润色", "Iconi")
+        MsgBox("未检测到 API Key。请用记事本打开 config\app.ini 填入", AppName, "Iconi")
         return
     }
     if p[1] = "no_python" {
-        MsgBox("未能启动校对程序 check_ai.exe。请确认工具目录里有 check_ai.exe（Go 编译，无需安装 Python），且未被杀毒软件拦截；仍不行请重新解压/复制整个工具目录。", "语句润色", "Iconi")
+        MsgBox("未能启动校对程序 check_ai.exe。请确认工具目录里有 check_ai.exe（Go 编译，无需安装 Python），且未被杀毒软件拦截；仍不行请重新解压/复制整个工具目录。", AppName, "Iconi")
         return
     }
     if p[1] = "error" {
-        MsgBox("AI 调用失败，请检查网络连接后重试；如超时可把 config\app.ini 里的 timeout 调大（当前 15 秒）", "语句润色", "Iconi")
+        MsgBox("AI 调用失败，请检查网络连接后重试；如超时可把 config\app.ini 里的 timeout 调大（当前 15 秒）", AppName, "Iconi")
         return
     }
 
-    ; 4. 弹窗预览润色结果（可编辑微调），确认后替换
-    ShowPolishGui(text, p[2], WinGetID("A"))
+    ; 4. 弹窗预览润色结果（可编辑微调），确认后按原模式替换
+    ShowPolishGui(text, p[2], WinGetID("A"), mode)
 }
 
-; ---------------- 润色结果弹窗（v5.0）----------------
-; 展示润色后的文本，Edit 可直接编辑微调；点"替换原文"回填输入框
-ShowPolishGui(orig, polished, targetHwnd) {
-    myGui := Gui("+AlwaysOnTop", "语句润色 · 预览")
+; ---------------- 润色结果弹窗（v5.0；v5.4 起标注模式）----------------
+; 展示润色后的文本，Edit 可直接编辑微调；点"替换原文"按 mode 回填
+;   mode = "sel" → 只覆盖原选区
+;   mode = "all" → 覆盖整个输入框
+ShowPolishGui(orig, polished, targetHwnd, mode) {
+    modeName := (mode = "sel") ? "手动选区" : "自动全选"
+    if mode = "sel"
+        modeHint := "手动选区模式：已选中 " StrLen(orig) " 字。点「替换原文」只覆盖选中的这一段，选区之外的文字保持不动。"
+    else
+        modeHint := "自动全选模式：未检测到选区，点「替换原文」将替换整个输入框的内容。"
+
+    myGui := Gui("+AlwaysOnTop", AppName " · 预览（" modeName "）")
     myGui.SetFont("s10", "Microsoft YaHei")
-    myGui.Add("Text", "w560", "润色结果（可直接编辑微调，点「替换原文」回填输入框）：")
+    myGui.Add("Text", "w560", "润色结果（可直接编辑微调）：")
+    myGui.SetFont("s9 norm")
+    myGui.Add("Text", "w560 c6B7280", modeHint)
+    myGui.SetFont("s10")
     edit := myGui.Add("Edit", "w560 h200 WantTab", polished)
 
     btnApply := myGui.Add("Button", "w130 h32 Default", "替换原文")
     btnClose := myGui.Add("Button", "x+12 w100 h32", "取消")
-    btnApply.OnEvent("Click", (*) => ApplyPolish(myGui, edit, targetHwnd))
+    btnApply.OnEvent("Click", (*) => ApplyPolish(myGui, edit, targetHwnd, mode))
     btnClose.OnEvent("Click", (*) => myGui.Destroy())
     myGui.Show()
 }
 
-; ---------------- 润色替换回填（v5.0）----------------
-ApplyPolish(myGui, editCtrl, targetHwnd) {
+; ---------------- 润色替换回填（v5.0；v5.4 起区分模式）----------------
+ApplyPolish(myGui, editCtrl, targetHwnd, mode) {
     newText := editCtrl.Text
     if Trim(newText) = "" {
-        MsgBox("润色结果为空，无法替换。请在弹窗里手动编辑内容后再点「替换原文」，或点「取消」。", "语句润色", "Iconi")
+        MsgBox("润色结果为空，无法替换。请在弹窗里手动编辑内容后再点「替换原文」，或点「取消」。", AppName, "Iconi")
         return
     }
 
@@ -368,15 +529,22 @@ ApplyPolish(myGui, editCtrl, targetHwnd) {
     myGui.Hide()               ; 先隐藏弹窗，露出原窗口
     WinActivate(targetHwnd)    ; 把焦点还给原输入框（关键修复）
     Sleep(150)                 ; 等窗口激活完成
-    Send("^a")
-    Sleep(80)
-    Send("^v")
+    if mode = "sel" {
+        ; 选区模式：读取阶段只发过 ^c，原选区未被破坏，直接粘贴就会
+        ; "用润色结果覆盖选区本身"，选区之外的文字一律不动。
+        ; 注意此处绝不能发 ^a，否则会变成整篇替换。
+        Send("^v")
+    } else {
+        Send("^a")
+        Sleep(80)
+        Send("^v")
+    }
     Sleep(120)
     A_Clipboard := saved
     myGui.Destroy()
     ; 右下角提醒可按配置关闭（[ui] tray_tip=false 时不弹）
     if TrayTipEnabled()
-        TrayTip("润色完成", "已替换为润色后的文本", 3)
+        TrayTip("润色完成 · " . ((mode = "sel") ? "已替换选中的部分" : "已替换为润色后的文本"), AppName, 3)
 }
 
 ; ---------------- 轻提示（主题卡片 + 淡入淡出，约 1 秒后自动关闭） ----------------
@@ -391,7 +559,7 @@ ShowAutoCloseTip(title, subtitle, durationMs := 1000) {
     barColor := "3B82F6"
     iconColor := "3B82F6"
     iconChar := "ℹ"
-    tipGui := Gui("+AlwaysOnTop -Caption +ToolWindow +E0x08000000", "语句润色")
+    tipGui := Gui("+AlwaysOnTop -Caption +ToolWindow +E0x08000000", AppName)
     tipGui.BackColor := "FFFFFF"
     tipGui.MarginX := 0
     tipGui.MarginY := 0

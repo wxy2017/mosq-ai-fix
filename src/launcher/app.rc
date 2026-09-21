@@ -1,1 +1,33 @@
 1 ICON "../assets/icon.ico"
+
+/* Program identity block.
+   Windows displays FileDescription / ProductName as the app name in Task Manager,
+   Startup apps, notifications and file properties. They are set to "mosq-ai-fix"
+   so that the name shown here matches the tray tooltip and the window titles
+   produced by runtime\typo_check.ahk (see its AppName constant) -- every place
+   the user sees must show the same single name.
+   NOTE: keep this file ASCII-only -- windres mishandles non-ASCII rc strings. */
+
+1 VERSIONINFO
+FILEVERSION     5,5,0,0
+PRODUCTVERSION  5,5,0,0
+FILEOS          0x40004L
+FILETYPE        0x1L
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "080404B0"
+    BEGIN
+      VALUE "FileDescription",  "mosq-ai-fix"
+      VALUE "FileVersion",      "5.5.0.0"
+      VALUE "InternalName",     "mosq-ai-fix"
+      VALUE "OriginalFilename", "mosq-ai-fix.exe"
+      VALUE "ProductName",      "mosq-ai-fix"
+      VALUE "ProductVersion",   "5.5.0.0"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x804, 1200
+  END
+END

@@ -5,14 +5,19 @@
 //   特殊标记: __NO_KEY__ 未配置Key | __ERROR__xxx 失败
 //
 // 常驻服务模式: check_ai.exe -server
-//   监听 127.0.0.1:<[server] port>，提供 POST /polish（前端热键调用的唯一入口）
+//   监听 127.0.0.1:<[server] port>，提供
+//     POST /polish    润色（前端热键调用的唯一业务入口）
+//     POST /shutdown  优雅退出（供前端在退出时回收本进程）
 //
 // v5.2 起移除错字检查（F8）功能，本程序仅负责语句润色（F9）。
 // v5.3 起移除磁盘缓存（原 <部署根>/.cache），每次调用均直连云端 API。
+// v5.5 起配置支持热重载：每次 /polish 前按 app.ini 的内容指纹判断是否重读，
+//   故改动 base_url/model/api_key 后无需重启本进程即刻生效（旧版本只在进程
+//   启动时读一次配置，而"关闭前端"并不会结束本进程，于是长期使用旧配置）。
 // 部署布局（v5.3）：本 exe 位于 <部署根>\runtime\，其上一级即部署根
 //   - 读取 <部署根>/config/app.ini（[ai]/[log]/[server] 段）
 //   - 调用云端 API（润色提示词）
-//   - debug=true 时写 <部署根>/config/ai_debug.log
+//   - [log] enabled=true 时写 <部署根>/config/ai_debug.log
 //
 // 编译: 推荐 build\build.ps1；或 cd src && go build -o ../dist/runtime/check_ai.exe ./backend
 // 本程序仅使用 Go 标准库，无第三方依赖，免安装、免 Python 环境。
@@ -68,7 +73,8 @@ const (
 var (
 	logEnabled  = true
 	logMaxBytes = int64(logMaxBytesDefault)
-	logMu       sync.Mutex // 串行化写入与裁剪：常驻服务会并发处理请求
+	logMu       sync.Mutex   // 串行化写入与裁剪：常驻服务会并发处理请求
+	logSink     func(string) // 仅测试使用：非 nil 时日志交给该回调，不落盘
 )
 
 // ---------- 配置 ----------
@@ -85,8 +91,8 @@ type config struct {
 	serverPort string
 }
 
-// loadConfig 解析 <工具根>/config/app.ini（兼容 ; 和 # 注释）
-func loadConfig(path string) *config {
+// parseConfig 解析 app.ini 的文本内容（兼容 ; 和 # 注释）
+func parseConfig(data []byte) *config {
 	cfg := &config{
 		model:      "glm-4-flash",
 		baseURL:    "https://open.bigmodel.cn/api/paas/v4/chat/completions",
@@ -95,10 +101,6 @@ func loadConfig(path string) *config {
 		logEnabled: true, // 调用日志默认开启
 		logMaxMB:   5,
 		serverPort: "18765",
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil
 	}
 	section := ""
 	for _, raw := range strings.Split(string(data), "\n") {
@@ -159,7 +161,97 @@ func loadConfig(path string) *config {
 	return cfg
 }
 
+// loadConfig 读取并解析 <工具根>/config/app.ini；文件不可读时返回 nil
+func loadConfig(path string) *config {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	return parseConfig(data)
+}
+
+// ---------- 配置热重载（v5.5）----------
+// 背景（历史 BUG）：常驻服务 check_ai.exe -server 是"分离启动"的进程，用户从托盘
+// 退出工具时它并不会结束。而配置原先只在进程启动时读一次，于是：
+//
+//	改完 app.ini → 重启前端 → EnsureServer() 看到端口有人应答就直接复用旧进程
+//	→ 旧进程内部仍是**旧 base_url / model / api_key**，日志里始终是旧地址。
+//
+// 修复思路：不再"读一次记一辈子"，而是按 **文件内容指纹** 惰性热重载 ——每次 /polish
+// 请求前比一次内容，变了就重建配置并同步日志参数，使配置改动即时生效，
+// 即使当前仍是那个"遗留进程"也无害。内容比对（而非 mtime/size）可避开
+// "同长度改写""编辑器改时间戳"等边界情况，1.5KB 的文件每次读一遍开销可忽略。
+type configStore struct {
+	path string
+
+	mu  sync.RWMutex
+	cfg *config
+	raw []byte // 上一次解析时的文件原始内容，用作指纹
+}
+
+func newConfigStore(path string) *configStore {
+	s := &configStore{path: path}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		data = nil // 配置缺失：用内置兜底值，仍保留日志能力
+	}
+	s.reloadFrom(data, false)
+	return s
+}
+
+// current 返回当前配置；若 app.ini 内容已变化则先重载。
+// 读取失败（如文件被编辑器短暂锁定）时沿用上一次的配置，绝不把配置清空。
+func (s *configStore) current() *config {
+	data, err := os.ReadFile(s.path)
+	if err != nil {
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+		return s.cfg
+	}
+	s.mu.RLock()
+	same := bytes.Equal(data, s.raw)
+	prev := s.cfg
+	s.mu.RUnlock()
+	if same {
+		return prev
+	}
+	return s.reloadFrom(data, true)
+}
+
+// reloadFrom 用给定内容重建配置；changed 仅用于决定是否记录一条重载日志。
+func (s *configStore) reloadFrom(data []byte, changed bool) *config {
+	cfg := parseConfig(data)
+	s.mu.Lock()
+	old := s.cfg
+	s.cfg, s.raw = cfg, data
+	s.mu.Unlock()
+
+	setLogConfig(cfg.logEnabled, cfg.logMaxMB) // 日志开关/上限同样要跟着刷新
+
+	if changed && old != nil {
+		if old.baseURL != cfg.baseURL || old.model != cfg.model {
+			rawLog(fmt.Sprintf("检测到 app.ini 变更，已热重载配置 | model=%s | base_url=%s", cfg.model, cfg.baseURL))
+		} else {
+			rawLog("检测到 app.ini 变更，已热重载配置（接口地址与模型未变）")
+		}
+	}
+	return cfg
+}
+
 // ---------- 调用日志（受 [log] enabled 控制，带体积上限）----------
+
+// setLogConfig 刷新日志开关与体积上限（供配置热重载调用）。
+// 与 rawLog 共用 logMu，避免"正在写日志时改参数"的竞态。
+func setLogConfig(enabled bool, maxMB int) {
+	logMu.Lock()
+	defer logMu.Unlock()
+	logEnabled = enabled
+	if maxMB > 0 {
+		logMaxBytes = int64(maxMB) * 1024 * 1024
+	} else {
+		logMaxBytes = int64(logMaxBytesDefault)
+	}
+}
 
 // rawLog 写一行日志："[时间] 内容"，多余参数按 fmt.Sprint 拼接。
 // 受 logEnabled 开关控制；写入前若会突破 logMaxBytes，则先丢弃最旧记录。
@@ -167,6 +259,9 @@ func loadConfig(path string) *config {
 // 可保证文件体积恒不超过上限，即使单条响应异常巨大也不会突破。
 // 行首统一带时间戳，故即使某条调用的记录块被裁剪掉前半，剩余行仍可独立解读。
 func rawLog(parts ...any) {
+	logMu.Lock() // 常驻服务并发处理请求，写入与裁剪必须串行；配置热重载也会改这里的开关
+	defer logMu.Unlock()
+
 	if !logEnabled || logPath == "" {
 		return
 	}
@@ -176,8 +271,10 @@ func rawLog(parts ...any) {
 	}
 	line := "[" + time.Now().Format("2006-01-02 15:04:05") + "] " + text + "\n"
 
-	logMu.Lock() // 常驻服务并发处理请求，写入与裁剪必须串行
-	defer logMu.Unlock()
+	if logSink != nil { // 仅测试使用：捕获日志而不落盘
+		logSink(line)
+		return
+	}
 
 	if fi, err := os.Stat(logPath); err == nil && fi.Size()+int64(len(line)) > logMaxBytes {
 		trimLogLocked()
@@ -264,23 +361,13 @@ func callAPI(cfg *config, prompt, text string) (string, error) {
 	// 注意：api_key 放在 Authorization 头中，不写入日志，避免密钥落盘
 	req.Header.Set("Authorization", "Bearer "+cfg.apiKey)
 
-	if httpClient == nil {
-		httpClient = &http.Client{
-			Timeout: time.Duration(cfg.timeout) * time.Second,
-			Transport: &http.Transport{
-				MaxIdleConns:    10,
-				IdleConnTimeout: 90 * time.Second,
-			},
-		}
-	}
-
 	// ---- 调用日志：请求侧 ----
 	rawLog("---- 大模型调用开始 ----")
 	rawLog("请求URL: ", cfg.baseURL)
 	rawLog("请求参数: ", logField(body))
 
 	start := time.Now()
-	resp, err := httpClient.Do(req)
+	resp, err := callHTTP(cfg, req)
 	elapsed := time.Since(start)
 	if err != nil {
 		rawLog(fmt.Sprintf("调用结果: 失败 | 耗时=%.2fs | %v", elapsed.Seconds(), err))
@@ -328,7 +415,40 @@ func callAPI(cfg *config, prompt, text string) (string, error) {
 // 注：v5.3 起已移除磁盘缓存（原 .cache 目录）。每次调用均直连云端 API，
 // 取舍见记忆档（放弃"同句二次调用免请求"，换取确定性失效逻辑与零磁盘残留）。
 
-var httpClient *http.Client
+var callHTTP = doHTTP
+
+// clientMu 保护 httpClient/httpClientTimeout：热重载可能改超时时间，届时重建客户端
+var (
+	clientMu          sync.Mutex
+	httpClient        *http.Client
+	httpClientTimeout int
+)
+
+// clientFor 返回超时为 timeout 秒的 HTTP 客户端，并复用连接池。
+// 超时时间变化时重建（旧客户端的 Timeout 是写死的），这使 [ai] timeout 的热重载也生效。
+func clientFor(timeout int) *http.Client {
+	if timeout <= 0 {
+		timeout = 8
+	}
+	clientMu.Lock()
+	defer clientMu.Unlock()
+	if httpClient == nil || httpClientTimeout != timeout {
+		httpClient = &http.Client{
+			Timeout: time.Duration(timeout) * time.Second,
+			Transport: &http.Transport{
+				MaxIdleConns:    10,
+				IdleConnTimeout: 90 * time.Second,
+			},
+		}
+		httpClientTimeout = timeout
+	}
+	return httpClient
+}
+
+// doHTTP 用配置中的超时发起请求（实际发送逻辑）
+func doHTTP(cfg *config, req *http.Request) (*http.Response, error) {
+	return clientFor(cfg.timeout).Do(req)
+}
 
 // corePolish 单段润色
 func corePolish(cfg *config, text string) (string, error) {
@@ -362,16 +482,16 @@ func processPolish(cfg *config, text string) (string, error) {
 }
 
 // startServer 常驻本地服务：复用连接池，提供 /polish 端点
-func startServer(cfg *config) {
-	httpClient = &http.Client{
-		Timeout: time.Duration(cfg.timeout) * time.Second,
-		Transport: &http.Transport{
-			MaxIdleConns:    10,
-			IdleConnTimeout: 90 * time.Second,
-		},
-	}
+func startServer(store *configStore) {
+	cfg := store.current() // 启动时读一次，仅用于绑定端口与建连接池
+	clientFor(cfg.timeout)
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/polish", func(w http.ResponseWriter, r *http.Request) {
+		// ★ 关键：每个请求都取一次当前配置（内部按文件内容指纹判是否重载）。
+		// 这样即便本进程是上一次遗留的"僵尸后端"，改了 app.ini 后下一次 F9
+		// 也会立刻用上新 base_url / model / api_key，而不是进程启动时的旧值。
+		cfg := store.current()
 		if cfg == nil || cfg.apiKey == "" {
 			io.WriteString(w, "__NO_KEY__")
 			return
@@ -393,7 +513,29 @@ func startServer(cfg *config) {
 		}
 		io.WriteString(w, content)
 	})
+
+	// /shutdown：前端退出时调用，请本进程优雅退出。
+	// 存在的意义：后端是"分离启动"的常驻进程，不随前端退出而结束；
+	// 若不主动收掉，它会一直占用端口并锁定 check_ai.exe 文件（阻碍重新构建/升级）。
+	mux.HandleFunc("/shutdown", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		rawLog("收到 /shutdown，常驻服务即将退出")
+		io.WriteString(w, "bye")
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush() // 先把响应发出去，再退出，避免前端拿到连接中断
+		}
+		go func() {
+			time.Sleep(120 * time.Millisecond)
+			os.Exit(0)
+		}()
+	})
+
 	addr := "127.0.0.1:" + cfg.serverPort
+	rawLog(fmt.Sprintf("常驻服务启动 | 监听 %s | model=%s | base_url=%s",
+		addr, cfg.model, cfg.baseURL))
 	_ = http.ListenAndServe(addr, mux)
 }
 
@@ -436,19 +578,15 @@ func main() {
 	iniPath := filepath.Join(rootDir, "config", "app.ini")
 	logPath = filepath.Join(rootDir, "config", "ai_debug.log")
 
-	cfg := loadConfig(iniPath)
-	if cfg == nil {
-		// 配置缺失时仍保留日志能力，便于排查"为什么没生效"
-		cfg = &config{serverPort: "18765", logEnabled: true, logMaxMB: 5}
-	}
-	logEnabled = cfg.logEnabled
-	if cfg.logMaxMB > 0 {
-		logMaxBytes = int64(cfg.logMaxMB) * 1024 * 1024
-	}
+	// 配置经 configStore 统一提供：
+	//   · -server 模式：每个请求前检查文件是否变更，变了立即热重载（见 configStore 注释）
+	//   · -polish 模式：一次性进程，读一次即可
+	store := newConfigStore(iniPath)
+	cfg := store.current()
 
-	// 常驻服务模式：启动本地 HTTP 服务后退出（由前端拉起）
+	// 常驻服务模式：启动本地 HTTP 服务（由前端拉起，之后常驻）
 	if len(os.Args) >= 2 && os.Args[1] == "-server" {
-		startServer(cfg)
+		startServer(store)
 		return
 	}
 	rawLog(fmt.Sprintf("脚本启动 | 参数数=%d | argv=%v", len(os.Args), os.Args))
