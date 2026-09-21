@@ -31,11 +31,16 @@ if !A_IsAdmin && A_Args.Length = 0 {
 ; v5.1 变更（性能优化）：
 ;  1. 后端常驻服务：首次使用时拉起 check_ai.exe -server 常驻本地
 ;     (127.0.0.1:ServerPort)，后续润色均走 HTTP 调用，
-;     免去每次调用都冷启动进程的开销，并复用连接池与磁盘缓存
-;  2. 相同/相似文本二次调用近乎瞬时（命中磁盘缓存）
+;     免去每次调用都冷启动进程的开销，并复用连接池
+;  2. 相同/相似文本二次调用近乎瞬时（命中磁盘缓存）※ 磁盘缓存已于 v5.3 移除
 ; v5.2 变更（功能收敛）：
 ;  1. 移除错字检查（原 F8）功能，本工具专注语句润色
 ;  2. 后端同步仅保留 /polish 端点
+; v5.3 变更（结构重构 + 去缓存）：
+;  1. 目录重构为 dist/src/build/tools 四区；本脚本恒部署在 <部署根>\runtime\
+;  2. 移除磁盘缓存（原 <部署根>\.cache），每次润色均直连云端 API：
+;     重复调用不再瞬时、同句结果措辞可能不同，但消除了"改提示词忘升级
+;     版本号导致一直吃旧结果"的隐患，磁盘上也不再有残留
 ; =============================================================
 
 ; 目录结构（v5.3）：脚本固定部署在 <部署根>\runtime\，其上一级即部署根
@@ -63,20 +68,30 @@ if FileExist(icoFile)
 ;   （须从 runtime\ 下以相对路径调用，或用绝对路径；结果直接打印到控制台）
 ; 说明：mosq-ai-fix.exe 为 GUI 子系统且不转发参数，故不能用它跑自检。
 ; 输出内容：配置读取结果 + 一次真实润色调用，用于验证部署完整性。
+; 报告同时写入文件（权威，路径见下）与控制台（尽力而为）：
+;   文件 %TEMP%\mosq_selftest.txt    —— build\build.ps1 读它来判定自检结果
 if A_Args.Length > 0 && A_Args[1] = "-selftest" {
     RunSelfTest()
     ExitApp()
 }
 
 RunSelfTest() {
-    FileAppend("AI 校对: " (IsAIEnabled() ? "已启用" : "未启用（编辑 config\app.ini 配置 API Key 后启用）") "`n", "*")
-    FileAppend("润色热键: " PolishKey "（改 config\app.ini 的 [hotkey] polish_key 后重启生效）`n", "*")
-    FileAppend("右下角提醒: " (TrayTipEnabled() ? "开启（[ui] tray_tip=true）" : "关闭（[ui] tray_tip=false）") "`n", "*")
+    global SelfTestReport
+    rep := ""
+    rep .= "AI 校对: " (IsAIEnabled() ? "已启用" : "未启用（编辑 config\app.ini 配置 API Key 后启用）") "`n"
+    rep .= "润色热键: " PolishKey "（改 config\app.ini 的 [hotkey] polish_key 后重启生效）`n"
+    rep .= "右下角提醒: " (TrayTipEnabled() ? "开启（[ui] tray_tip=true）" : "关闭（[ui] tray_tip=false）") "`n"
     ; 润色自检：结果不稳定，只验证调用成功且输出非空
     p := RunPolish("我今天真的挺想去的，但是时间上面好像有点不太够。")
-    FileAppend("润色状态: " p[1] "，结果长度 " StrLen(p[2]) " 字`n", "*")
+    rep .= "润色状态: " p[1] "，结果长度 " StrLen(p[2]) " 字`n"
     if p[2] != ""
-        FileAppend("  " p[2] "`n", "*")
+        rep .= "  " p[2] "`n"
+
+    ; 必须写文件：GUI 子系统的 stdout 句柄在部分宿主下不可用（如 PowerShell 的 & 调用），
+    ; 只写 stdout 会让自检结果不可见、也无法被构建脚本判定。
+    SelfTestReport := A_Temp "\mosq_selftest.txt"
+    try FileAppend(rep, SelfTestReport, "UTF-8")
+    try FileAppend(rep, "*")
 }
 
 ; ---------------- 焦点可编辑检测 ----------------

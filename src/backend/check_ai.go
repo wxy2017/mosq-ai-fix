@@ -8,11 +8,11 @@
 //   监听 127.0.0.1:<[server] port>，提供 POST /polish（前端热键调用的唯一入口）
 //
 // v5.2 起移除错字检查（F8）功能，本程序仅负责语句润色（F9）。
+// v5.3 起移除磁盘缓存（原 <部署根>/.cache），每次调用均直连云端 API。
 // 部署布局（v5.3）：本 exe 位于 <部署根>\runtime\，其上一级即部署根
 //   - 读取 <部署根>/config/app.ini（[ai]/[log]/[server] 段）
 //   - 调用云端 API（润色提示词）
 //   - debug=true 时写 <部署根>/config/ai_debug.log
-//   - 缓存写 <部署根>/.cache
 //
 // 编译: 推荐 build\build.ps1；或 cd src && go build -o ../dist/runtime/check_ai.exe ./backend
 // 本程序仅使用 Go 标准库，无第三方依赖，免安装、免 Python 环境。
@@ -21,8 +21,6 @@ package main
 
 import (
 	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -31,7 +29,9 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // polishPrompt 增强润色模式：参考WorkBuddy增强提示词，使润色更专业、得体
@@ -56,6 +56,21 @@ const polishPrompt = `你是一个资深的中文编辑和写作老师，专长�
 
 var logPath string // ai_debug.log 绝对路径（main 中初始化）
 
+// ---------- 日志运行期参数（main 中由配置注入）----------
+
+const (
+	logMaxBytesDefault = 5 * 1024 * 1024 // 日志体积上限默认 5MB
+	logKeepRatio       = 4               // 超限时保留 4/5 …
+	logKeepDenom       = 5               // …即丢弃最旧的 1/5
+	logFieldMaxBytes   = 1 << 20         // 请求参数/响应体的单字段预截断阈值（1MB）
+)
+
+var (
+	logEnabled  = true
+	logMaxBytes = int64(logMaxBytesDefault)
+	logMu       sync.Mutex // 串行化写入与裁剪：常驻服务会并发处理请求
+)
+
 // ---------- 配置 ----------
 
 type config struct {
@@ -65,17 +80,20 @@ type config struct {
 	baseURL    string
 	timeout    int
 	maxText    int
-	debug      bool
+	logEnabled bool
+	logMaxMB   int
 	serverPort string
 }
 
-// loadConfig 解析 <工具根>/config/typo_config.ini（兼容 ; 和 # 注释）
+// loadConfig 解析 <工具根>/config/app.ini（兼容 ; 和 # 注释）
 func loadConfig(path string) *config {
 	cfg := &config{
 		model:      "glm-4-flash",
 		baseURL:    "https://open.bigmodel.cn/api/paas/v4/chat/completions",
 		timeout:    8,
 		maxText:    500,
+		logEnabled: true, // 调用日志默认开启
+		logMaxMB:   5,
 		serverPort: "18765",
 	}
 	data, err := os.ReadFile(path)
@@ -124,8 +142,12 @@ func loadConfig(path string) *config {
 			}
 		case "log":
 			switch key {
-			case "debug":
-				cfg.debug = strings.EqualFold(val, "true")
+			case "enabled", "debug": // debug 为 v5.2 及更早的旧键名，保留兼容
+				cfg.logEnabled = strings.EqualFold(val, "true")
+			case "max_size_mb":
+				if n, err := strconv.Atoi(val); err == nil && n > 0 {
+					cfg.logMaxMB = n
+				}
 			}
 		case "server":
 			switch key {
@@ -137,25 +159,85 @@ func loadConfig(path string) *config {
 	return cfg
 }
 
-// ---------- 调试日志 ----------
+// ---------- 调用日志（受 [log] enabled 控制，带体积上限）----------
 
-// rawLog 无条件写一行日志（不依赖配置是否加载成功）
-func rawLog(msg string) {
+// rawLog 写一行日志："[时间] 内容"，多余参数按 fmt.Sprint 拼接。
+// 受 logEnabled 开关控制；写入前若会突破 logMaxBytes，则先丢弃最旧记录。
+// 单行长度被限制在上限的 1/5（logKeepDenom），因此「裁剪后保留 4/5 + 追加 ≤1/5」
+// 可保证文件体积恒不超过上限，即使单条响应异常巨大也不会突破。
+// 行首统一带时间戳，故即使某条调用的记录块被裁剪掉前半，剩余行仍可独立解读。
+func rawLog(parts ...any) {
+	if !logEnabled || logPath == "" {
+		return
+	}
+	text, truncated := cutBytes(fmt.Sprint(parts...), int(logMaxBytes/logKeepDenom))
+	if truncated {
+		text += "...（单条日志过长已截断）"
+	}
+	line := "[" + time.Now().Format("2006-01-02 15:04:05") + "] " + text + "\n"
+
+	logMu.Lock() // 常驻服务并发处理请求，写入与裁剪必须串行
+	defer logMu.Unlock()
+
+	if fi, err := os.Stat(logPath); err == nil && fi.Size()+int64(len(line)) > logMaxBytes {
+		trimLogLocked()
+	}
 	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return
 	}
 	defer f.Close()
-	ts := time.Now().Format("2006-01-02 15:04:05")
-	fmt.Fprintf(f, "[%s] %s\n", ts, msg)
+	_, _ = io.WriteString(f, line)
 }
 
-// debugLog 仅在 debug=true 时写日志
-func debugLog(cfg *config, msg string) {
-	if cfg == nil || !cfg.debug {
+// cutBytes 把 s 截断到至多 max 字节，且不切断 UTF-8 字符；第二个返回值为是否发生截断。
+func cutBytes(s string, max int) (string, bool) {
+	if max < 0 || len(s) <= max {
+		return s, false
+	}
+	cut := max
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut], true
+}
+
+// trimLogLocked 丢弃日志头部（最旧记录），只保留尾部 4/5。
+// 调用方必须已持有 logMu。裁剪点对齐到行首，避免留下半行。
+func trimLogLocked() {
+	data, err := os.ReadFile(logPath)
+	if err != nil {
 		return
 	}
-	rawLog(msg)
+	keep := logMaxBytes * logKeepRatio / logKeepDenom
+	if int64(len(data)) <= keep {
+		return
+	}
+	cut := int64(len(data)) - keep
+	for cut < int64(len(data)) && data[cut] != '\n' {
+		cut++
+	}
+	if cut < int64(len(data)) {
+		cut++ // 连同换行符一起丢弃
+	}
+	// 先写临时文件再原子替换：裁剪中途失败不会破坏原日志
+	tmp := logPath + ".tmp"
+	if err := os.WriteFile(tmp, data[cut:], 0644); err != nil {
+		return
+	}
+	if err := os.Rename(tmp, logPath); err != nil {
+		_ = os.Remove(tmp)
+	}
+}
+
+// logField 把可能很大的请求参数/响应体转成可安全落盘的字符串，
+// 超过 logFieldMaxBytes 时按 UTF-8 字符边界截断并标注原始长度。
+func logField(b []byte) string {
+	s, truncated := cutBytes(string(b), logFieldMaxBytes)
+	if truncated {
+		return s + fmt.Sprintf("...（已截断，原始 %d 字节）", len(b))
+	}
+	return s
 }
 
 // ---------- 智谱 API ----------
@@ -179,6 +261,7 @@ func callAPI(cfg *config, prompt, text string) (string, error) {
 		return "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	// 注意：api_key 放在 Authorization 头中，不写入日志，避免密钥落盘
 	req.Header.Set("Authorization", "Bearer "+cfg.apiKey)
 
 	if httpClient == nil {
@@ -190,15 +273,34 @@ func callAPI(cfg *config, prompt, text string) (string, error) {
 			},
 		}
 	}
+
+	// ---- 调用日志：请求侧 ----
+	rawLog("---- 大模型调用开始 ----")
+	rawLog("请求URL: ", cfg.baseURL)
+	rawLog("请求参数: ", logField(body))
+
+	start := time.Now()
 	resp, err := httpClient.Do(req)
+	elapsed := time.Since(start)
 	if err != nil {
+		rawLog(fmt.Sprintf("调用结果: 失败 | 耗时=%.2fs | %v", elapsed.Seconds(), err))
+		rawLog("---- 大模型调用结束 ----")
 		return "", err
 	}
 	defer resp.Body.Close()
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
+		rawLog(fmt.Sprintf("调用结果: 读取响应失败 | 耗时=%.2fs | %v", elapsed.Seconds(), err))
+		rawLog("---- 大模型调用结束 ----")
 		return "", err
 	}
+
+	// ---- 调用日志：响应侧（含完整响应体）----
+	rawLog(fmt.Sprintf("响应状态: HTTP %d | 耗时=%.2fs | 响应体 %d 字节",
+		resp.StatusCode, elapsed.Seconds(), len(respBody)))
+	rawLog("完整响应: ", logField(respBody))
+	rawLog("---- 大模型调用结束 ----")
+
 	if resp.StatusCode != http.StatusOK {
 		msg := strings.TrimSpace(string(respBody))
 		if len(msg) > 200 {
@@ -222,47 +324,15 @@ func callAPI(cfg *config, prompt, text string) (string, error) {
 	return data.Choices[0].Message.Content, nil
 }
 
-// ---------- 性能优化：缓存 / 分块 / 常驻服务 ----------
-
-// promptVersion 缓存失效标记：polishPrompt 变更时改此值（v5.2 起仅覆盖润色）
-const promptVersion = "v5.2"
+// ---------- 性能优化：分块 / 常驻服务 ----------
+// 注：v5.3 起已移除磁盘缓存（原 .cache 目录）。每次调用均直连云端 API，
+// 取舍见记忆档（放弃"同句二次调用免请求"，换取确定性失效逻辑与零磁盘残留）。
 
 var httpClient *http.Client
-var cacheDir string
 
-func sha256hex(s string) string {
-	h := sha256.Sum256([]byte(s))
-	return hex.EncodeToString(h[:])
-}
-
-func cachePath(key string) string {
-	return filepath.Join(cacheDir, sha256hex(key)+".json")
-}
-
-func cacheGet(key string) ([]byte, bool) {
-	data, err := os.ReadFile(cachePath(key))
-	if err != nil {
-		return nil, false
-	}
-	return data, true
-}
-
-func cachePut(key string, data []byte) {
-	_ = os.WriteFile(cachePath(key), data, 0644)
-}
-
-// corePolish 单段润色（含缓存）
+// corePolish 单段润色
 func corePolish(cfg *config, text string) (string, error) {
-	key := "polish|" + promptVersion + "|" + cfg.model + "|" + cfg.baseURL + "|" + text
-	if data, ok := cacheGet(key); ok {
-		return string(data), nil
-	}
-	content, err := callAPI(cfg, polishPrompt, text)
-	if err != nil {
-		return "", err
-	}
-	cachePut(key, []byte(content))
-	return content, nil
+	return callAPI(cfg, polishPrompt, text)
 }
 
 // processPolish 对外润色入口：超长分块拼接
@@ -361,35 +431,34 @@ func main() {
 	if err != nil {
 		exePath = os.Args[0]
 	}
-	exeDir := filepath.Dir(exePath)  // .../dist/runtime
-	rootDir := filepath.Dir(exeDir)  // 部署根（dist/）
+	exeDir := filepath.Dir(exePath) // .../dist/runtime
+	rootDir := filepath.Dir(exeDir) // 部署根（dist/）
 	iniPath := filepath.Join(rootDir, "config", "app.ini")
 	logPath = filepath.Join(rootDir, "config", "ai_debug.log")
 
 	cfg := loadConfig(iniPath)
 	if cfg == nil {
-		cfg = &config{serverPort: "18765"}
+		// 配置缺失时仍保留日志能力，便于排查"为什么没生效"
+		cfg = &config{serverPort: "18765", logEnabled: true, logMaxMB: 5}
 	}
-	cacheDir = filepath.Join(rootDir, ".cache")
-	_ = os.MkdirAll(cacheDir, 0755)
+	logEnabled = cfg.logEnabled
+	if cfg.logMaxMB > 0 {
+		logMaxBytes = int64(cfg.logMaxMB) * 1024 * 1024
+	}
 
 	// 常驻服务模式：启动本地 HTTP 服务后退出（由前端拉起）
 	if len(os.Args) >= 2 && os.Args[1] == "-server" {
 		startServer(cfg)
 		return
 	}
-	if cfg != nil && cfg.debug {
-		rawLog(fmt.Sprintf("脚本启动 | 参数数=%d | argv=%v", len(os.Args), os.Args))
-	}
+	rawLog(fmt.Sprintf("脚本启动 | 参数数=%d | argv=%v", len(os.Args), os.Args))
 
 	// 模式判定：check_ai.exe -polish <input.txt> <output.txt>
 	// v5.2 起错字检查（F8）已移除，CLI 仅保留润色模式
 	if len(os.Args) < 4 || os.Args[1] != "-polish" {
 		fmt.Println("用法: check_ai.exe -polish <input.txt> <output.txt>")
 		fmt.Println("  润色语句: check_ai.exe -polish in.txt out.txt")
-		if cfg != nil && cfg.debug {
-			rawLog(fmt.Sprintf("退出: 参数不合法，argv=%v", os.Args))
-		}
+		rawLog(fmt.Sprintf("退出: 参数不合法，argv=%v", os.Args))
 		return
 	}
 	inPath, outPath := os.Args[2], os.Args[3]
@@ -397,54 +466,44 @@ func main() {
 	// 读输入文本（容忍 UTF-8 BOM）
 	data, err := os.ReadFile(inPath)
 	if err != nil {
-		if cfg != nil && cfg.debug {
-			rawLog(fmt.Sprintf("读取输入文件失败: %v", err))
-		}
+		rawLog(fmt.Sprintf("读取输入文件失败: %v", err))
 		return
 	}
 	text := strings.TrimSpace(strings.TrimPrefix(string(data), "\ufeff"))
 	if text == "" {
-		if cfg != nil && cfg.debug {
-			rawLog("退出: 输入文本为空")
-		}
+		rawLog("退出: 输入文本为空")
 		return
 	}
 
-	debugLog(cfg, fmt.Sprintf("开始润色 | 模型=%s | base_url=%s | 文本长度=%d",
+	rawLog(fmt.Sprintf("开始润色 | 模型=%s | base_url=%s | 文本长度=%d",
 		cfg.model, cfg.baseURL, len(text)))
 
 	// 未配置 Key
 	if cfg == nil || cfg.apiKey == "" {
-		debugLog(cfg, "结果: __NO_KEY__")
+		rawLog("结果: __NO_KEY__")
 		_ = os.WriteFile(outPath, []byte("__NO_KEY__\n"), 0644)
 		return
 	}
 
-	// 调用云端 AI（内部含分块与缓存，超长自动切片）
-	debugLog(cfg, fmt.Sprintf("发送请求 | text长度=%d | model=%s | url=%s", len(text), cfg.model, cfg.baseURL))
+	// 调用云端 AI（超长自动切片）
+	rawLog(fmt.Sprintf("发送请求 | text长度=%d | model=%s | url=%s", len(text), cfg.model, cfg.baseURL))
 	start := time.Now()
 	content, err := processPolish(cfg, text)
 	if err != nil {
 		elapsed := time.Since(start).Seconds()
-		debugLog(cfg, fmt.Sprintf("调用失败 | 耗时=%.2fs | %v", elapsed, err))
+		rawLog(fmt.Sprintf("调用失败 | 耗时=%.2fs | %v", elapsed, err))
 		_ = os.WriteFile(outPath, []byte(fmt.Sprintf("__ERROR__%v\n", err)), 0644)
 		return
 	}
 	elapsed := time.Since(start).Seconds()
-	preview := strings.ReplaceAll(content, "\n", " ")
-	preview = strings.ReplaceAll(preview, "\r", " ")
-	if len(preview) > 200 {
-		preview = preview[:200]
-	}
-	debugLog(cfg, fmt.Sprintf("收到响应 | 耗时=%.2fs | 预览=%s", elapsed, preview))
 
-	// 直接写润色后文本
+	// 写润色后文本（完整响应体已由 callAPI 记入日志，此处不再重复记录预览）
 	polished := cleanPolish(content)
+	rawLog(fmt.Sprintf("收到响应 | 耗时=%.2fs | 润色后长度=%d", elapsed, len(polished)))
 	if polished == "" {
-		debugLog(cfg, "解析结果 | 润色文本为空")
+		rawLog("解析结果 | 润色文本为空")
 		_ = os.WriteFile(outPath, []byte("__ERROR__空响应\n"), 0644)
 		return
 	}
-	debugLog(cfg, fmt.Sprintf("解析结果 | 润色后长度=%d", len(polished)))
 	_ = os.WriteFile(outPath, []byte(polished), 0644)
 }

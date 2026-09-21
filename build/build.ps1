@@ -123,22 +123,39 @@ try {
 
     # ---- 6) 汇总 ----
     Step '构建完成，dist\ 内容如下'
-    # dist\.cache\ 是运行时磁盘缓存（由 check_ai.exe 自动生成，含历史润色文本），
-    # 不属于交付物，打包分发前可放心删除，故不计入下面的清单。
-    $distFiles = Get-ChildItem $dist -Recurse -File | Where-Object { $_.FullName -notmatch '\\\.cache\\' }
-    $total = ($distFiles | Measure-Object Length -Sum).Sum
-    Write-Host ("   部署区合计 {0:N1} MB（不含运行时缓存 .cache）" -f ($total / 1MB))
-    $distFiles | Sort-Object FullName | ForEach-Object {
+    $total = (Get-ChildItem $dist -Recurse -File | Measure-Object Length -Sum).Sum
+    Write-Host ("   部署区合计 {0:N1} MB" -f ($total / 1MB))
+    Get-ChildItem $dist -Recurse -File | Sort-Object FullName | ForEach-Object {
         Write-Host ('   {0,9:N0} KB  {1}' -f ($_.Length / 1KB), $_.FullName.Replace("$RepoRoot\", ''))
     }
+    # v5.3 起已移除磁盘缓存，构建不再生成 dist\.cache\；此处仅提示历史遗留目录
     if (Test-Path (Join-Path $dist '.cache')) {
-        Warn 'dist\.cache\ 为运行时缓存（可删）；打包分发前建议一并清理'
+        Warn '发现旧版遗留的 dist\.cache\（v5.3 起已不再生成），可安全删除'
     }
 
     # ---- 7) 前端自检 ----
     if ($RunSelfTest) {
         Step '前端自检（-selftest，跑完即退，不注册热键）'
+        # 自检报告由 AHK 写入 %TEMP%\mosq_selftest.txt（权威来源）。
+        # 不能依赖 stdout：GUI 子系统在 PowerShell 的 & 调用下拿不到可用的 stdout 句柄，
+        # 只读 stdout 会得到空结果，自检看起来"跑了"，实际无法判定。
+        $selftestReport = Join-Path $env:TEMP 'mosq_selftest.txt'
+        Remove-Item $selftestReport -Force -ErrorAction SilentlyContinue
+        # 注意：绝不可写成 `& $AhkExe ... | Out-Null` 之类的管道/重定向 ——
+        # 自检会拉起常驻 check_ai.exe，它继承 stdout 句柄且长期不退出，
+        # 管道因此永不结束，构建会假死在自检这一步。
         & $AhkExe (Join-Path $distRt 'typo_check.ahk') -selftest
+        if (Test-Path $selftestReport) {
+            $lines = @(Get-Content $selftestReport -Encoding UTF8)
+            foreach ($l in $lines) { Write-Host "   $l" }
+            # 网络/密钥问题不应让构建失败，但必须显式提示
+            $status = ($lines | Where-Object { $_ -like '润色状态:*' } | Select-Object -First 1)
+            if ($status -and $status -notmatch '润色状态:\s*ok') {
+                Warn "自检未通过：$status（不影响产物生成，请检查网络与 config\app.ini）"
+            }
+        } else {
+            Warn '自检未生成报告 —— 自检可能未真正执行，请手动确认'
+        }
     }
 
     Write-Host 'BUILD OK' -ForegroundColor Green
