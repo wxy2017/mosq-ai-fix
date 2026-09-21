@@ -94,6 +94,7 @@ const (
 	logKeepRatio       = 4               // 超限时保留 4/5 …
 	logKeepDenom       = 5               // …即丢弃最旧的 1/5
 	logFieldMaxBytes   = 1 << 20         // 请求参数/响应体的单字段预截断阈值（1MB）
+	logFileName        = "ai_debug.log"  // 日志文件名（[log] dir 只指定目录时用这个名字）
 )
 
 var (
@@ -101,6 +102,11 @@ var (
 	logMaxBytes = int64(logMaxBytesDefault)
 	logMu       sync.Mutex   // 串行化写入与裁剪：常驻服务会并发处理请求
 	logSink     func(string) // 仅测试使用：非 nil 时日志交给该回调，不落盘
+
+	// baseDir 部署根（= check_ai.exe 的上一级目录，main 中初始化）。
+	// [log] dir 给的相对路径一律相对它解析 —— 不依赖进程工作目录，
+	// 这样"双击启动"和"命令行启动"得到的路径一致。
+	baseDir = ""
 )
 
 // ---------- 配置 ----------
@@ -114,6 +120,7 @@ type config struct {
 	maxText    int
 	logEnabled bool
 	logMaxMB   int
+	logDir     string // [log] dir：日志输出位置；空 = 用默认目录（部署根\config）
 	serverPort string
 }
 
@@ -126,6 +133,7 @@ func parseConfig(data []byte) *config {
 		maxText:    500,
 		logEnabled: true, // 调用日志默认开启
 		logMaxMB:   5,
+		logDir:     "", // 空 = 默认目录（部署根\config）
 		serverPort: "18765",
 	}
 	section := ""
@@ -176,6 +184,8 @@ func parseConfig(data []byte) *config {
 				if n, err := strconv.Atoi(val); err == nil && n > 0 {
 					cfg.logMaxMB = n
 				}
+			case "dir", "path": // 日志输出位置；两个键名等价，同一文件里以靠后的为准
+				cfg.logDir = val
 			}
 		case "server":
 			switch key {
@@ -252,7 +262,7 @@ func (s *configStore) reloadFrom(data []byte, changed bool) *config {
 	s.cfg, s.raw = cfg, data
 	s.mu.Unlock()
 
-	setLogConfig(cfg.logEnabled, cfg.logMaxMB) // 日志开关/上限同样要跟着刷新
+	applyLogConfig(cfg) // 日志开关/上限/落盘位置都要跟着配置刷新（含 [log] dir 变更）
 
 	if changed && old != nil {
 		if old.baseURL != cfg.baseURL || old.model != cfg.model {
@@ -266,17 +276,123 @@ func (s *configStore) reloadFrom(data []byte, changed bool) *config {
 
 // ---------- 调用日志（受 [log] enabled 控制，带体积上限）----------
 
-// setLogConfig 刷新日志开关与体积上限（供配置热重载调用）。
-// 与 rawLog 共用 logMu，避免"正在写日志时改参数"的竞态。
-func setLogConfig(enabled bool, maxMB int) {
+// ---------- 日志落盘位置解析（v5.6.1：支持 [log] dir 自定义 + 异常回退）----------
+//
+// 读取优先级（高 → 低）：
+//   ① [log] dir（或等价别名 [log] path）配置的路径，且该位置可用
+//   ② 默认目录：<部署根>\config\ai_debug.log
+//   ③ 上面两个都不可用 → 关闭日志（logEnabled=false），业务功能不受影响
+//
+// 值的形态：
+//   · 留空           → 用默认目录
+//   · 以 .log 结尾   → 视为完整文件路径，直接用
+//   · 其他           → 视为目录，文件名固定 ai_debug.log
+//   · 相对路径       → 相对**部署根**解析（不依赖进程工作目录，避免"双击 vs 命令行"不一致）
+//
+// 异常处理：目录不存在 → MkdirAll 自动创建；MkdirAll 成功但文件打不开（只读盘、
+// 无权限、被独占）→ 判定该位置不可用，回退到默认目录，并在默认日志里记一条警告。
+
+// logTarget 日志落盘位置的解析结果
+type logTarget struct {
+	path       string // 最终日志文件绝对路径；空串 = 无处可写
+	fallback   bool   // 是否从自定义位置回退到了默认目录
+	failReason string // 回退/失败原因
+}
+
+// prepareLogFile 把配置值规整成日志文件绝对路径，并确保其父目录存在且文件可写。
+// 空值 = 默认目录。返回 error 表示"这个位置不可用"。
+//
+// 防御：baseDir（部署根）未初始化时直接报错，绝不按进程工作目录去建目录 ——
+// 否则测试或异常启动会在源码/当前目录里冒出 config\ai_debug.log。
+func prepareLogFile(v string) (string, error) {
+	v = strings.TrimSpace(v)
+	var file string
+	switch {
+	case v == "":
+		if baseDir == "" {
+			return "", fmt.Errorf("部署根未初始化，无法确定默认日志目录")
+		}
+		file = filepath.Join(baseDir, "config", logFileName)
+	case filepath.IsAbs(v):
+		if strings.EqualFold(filepath.Ext(v), ".log") {
+			file = v
+		} else {
+			file = filepath.Join(v, logFileName)
+		}
+	default:
+		if baseDir == "" {
+			return "", fmt.Errorf("部署根未初始化，无法解析相对日志路径 %s", v)
+		}
+		full := filepath.Join(baseDir, v)
+		if strings.EqualFold(filepath.Ext(full), ".log") {
+			file = full
+		} else {
+			file = filepath.Join(full, logFileName)
+		}
+	}
+	dir := filepath.Dir(file)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", fmt.Errorf("目录 %s 无法创建（%v）", dir, err)
+	}
+	// MkdirAll 成功不等于可写：只读盘、ACL 拒绝、文件被独占都要靠真正试开一次才能发现
+	f, err := os.OpenFile(file, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return "", fmt.Errorf("文件 %s 不可写（%v）", file, err)
+	}
+	_ = f.Close()
+	return file, nil
+}
+
+// resolveLogTarget 按优先级解析日志位置，必要时回退到默认目录
+func resolveLogTarget(cfg *config) logTarget {
+	if strings.TrimSpace(cfg.logDir) != "" {
+		if p, err := prepareLogFile(cfg.logDir); err == nil {
+			return logTarget{path: p}
+		} else {
+			def, derr := prepareLogFile("")
+			if derr != nil {
+				return logTarget{fallback: true,
+					failReason: fmt.Sprintf("自定义位置：%v；默认目录：%v", err, derr)}
+			}
+			return logTarget{path: def, fallback: true, failReason: err.Error()}
+		}
+	}
+	p, err := prepareLogFile("")
+	if err != nil {
+		return logTarget{failReason: err.Error()}
+	}
+	return logTarget{path: p}
+}
+
+// applyLogConfig 依配置决定日志文件路径与开关，并同步刷新上限。
+// 供 configStore 每次重载时调用，因此改 [log] dir 后无需重启即可生效。
+func applyLogConfig(cfg *config) {
+	t := resolveLogTarget(cfg)
+
 	logMu.Lock()
-	defer logMu.Unlock()
-	logEnabled = enabled
-	if maxMB > 0 {
-		logMaxBytes = int64(maxMB) * 1024 * 1024
+	logPath = t.path
+	logEnabled = cfg.logEnabled && t.path != "" // 无处可写时直接关掉，避免反复试开
+	if cfg.logMaxMB > 0 {
+		logMaxBytes = int64(cfg.logMaxMB) * 1024 * 1024
 	} else {
 		logMaxBytes = int64(logMaxBytesDefault)
 	}
+	logMu.Unlock()
+
+	if t.path == "" {
+		return // 连默认目录都写不了：静默关闭日志，不干扰润色/翻译
+	}
+	if t.fallback {
+		rawLog("警告: [log] dir 指定的位置不可用，已回退到默认目录 | 原因: ", t.failReason)
+		rawLog("当前实际日志文件: ", t.path)
+	}
+}
+
+// currentLogPath 读取当前生效的日志文件路径（加锁，供日志/自检展示）
+func currentLogPath() string {
+	logMu.Lock()
+	defer logMu.Unlock()
+	return logPath
 }
 
 // rawLog 写一行日志："[时间] 内容"，多余参数按 fmt.Sprint 拼接。
@@ -365,8 +481,16 @@ func logField(b []byte) string {
 
 // ---------- 智谱 API ----------
 
+// procResult 一次文本处理的结果。
+// Model 来自响应体的 model 字段 —— 它是**实际**服务本次请求的模型
+// （上游/中转可能把请求里的模型名改写掉），前端标题栏展示的就是它。
+type procResult struct {
+	Text  string
+	Model string
+}
+
 // kind 仅用于日志区分本次调用属于哪个功能（润色 / 翻译）
-func callAPI(cfg *config, kind, prompt, text string) (string, error) {
+func callAPI(cfg *config, kind, prompt, text string) (procResult, error) {
 	payload := map[string]any{
 		"model": cfg.model,
 		"messages": []map[string]string{
@@ -378,11 +502,11 @@ func callAPI(cfg *config, kind, prompt, text string) (string, error) {
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return "", err
+		return procResult{}, err
 	}
 	req, err := http.NewRequest("POST", cfg.baseURL, bytes.NewReader(body))
 	if err != nil {
-		return "", err
+		return procResult{}, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	// 注意：api_key 放在 Authorization 头中，不写入日志，避免密钥落盘
@@ -394,25 +518,29 @@ func callAPI(cfg *config, kind, prompt, text string) (string, error) {
 	rawLog("请求URL: ", cfg.baseURL)
 	rawLog("请求参数: ", logField(body))
 
+	// ⚠️ 计时点必须在**读完响应体之后**：
+	// 非流式接口下大模型是"先回响应头、再花几秒把正文生成完"（实测响应头 0.26s
+	// 就回来了，正文 7s 才到），若把计时停在 client.Do 返回处，日志会报出
+	// "只花了 0.1 秒"的错误结论——真实耗时其实是这里的 total。
 	start := time.Now()
 	resp, err := callHTTP(cfg, req)
-	elapsed := time.Since(start)
 	if err != nil {
-		rawLog(fmt.Sprintf("调用结果: 失败 | 耗时=%.2fs | %v", elapsed.Seconds(), err))
+		rawLog(fmt.Sprintf("调用结果: 失败 | 耗时=%.2fs | %v", time.Since(start).Seconds(), err))
 		rawLog("---- 大模型调用结束 ----")
-		return "", err
+		return procResult{}, err
 	}
 	defer resp.Body.Close()
 	respBody, err := io.ReadAll(resp.Body)
+	total := time.Since(start)
 	if err != nil {
-		rawLog(fmt.Sprintf("调用结果: 读取响应失败 | 耗时=%.2fs | %v", elapsed.Seconds(), err))
+		rawLog(fmt.Sprintf("调用结果: 读取响应失败 | 耗时=%.2fs | %v", total.Seconds(), err))
 		rawLog("---- 大模型调用结束 ----")
-		return "", err
+		return procResult{}, err
 	}
 
 	// ---- 调用日志：响应侧（含完整响应体）----
-	rawLog(fmt.Sprintf("响应状态: HTTP %d | 耗时=%.2fs | 响应体 %d 字节",
-		resp.StatusCode, elapsed.Seconds(), len(respBody)))
+	rawLog(fmt.Sprintf("响应状态: HTTP %d | 总耗时=%.2fs | 响应体 %d 字节",
+		resp.StatusCode, total.Seconds(), len(respBody)))
 	rawLog("完整响应: ", logField(respBody))
 	rawLog("---- 大模型调用结束 ----")
 
@@ -421,9 +549,12 @@ func callAPI(cfg *config, kind, prompt, text string) (string, error) {
 		if len(msg) > 200 {
 			msg = msg[:200]
 		}
-		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, msg)
+		return procResult{}, fmt.Errorf("HTTP %d: %s", resp.StatusCode, msg)
 	}
 	var data struct {
+		// model 是**实际**服务本次请求的模型名，可能被上游/中转改写，
+		// 与请求里填的 cfg.model 不一定相同 —— 前端标题栏展示的就是它
+		Model   string `json:"model"`
 		Choices []struct {
 			Message struct {
 				Content string `json:"content"`
@@ -431,12 +562,12 @@ func callAPI(cfg *config, kind, prompt, text string) (string, error) {
 		} `json:"choices"`
 	}
 	if err := json.Unmarshal(respBody, &data); err != nil {
-		return "", err
+		return procResult{}, err
 	}
 	if len(data.Choices) == 0 {
-		return "", fmt.Errorf("no choices in response")
+		return procResult{}, fmt.Errorf("no choices in response")
 	}
-	return data.Choices[0].Message.Content, nil
+	return procResult{Text: data.Choices[0].Message.Content, Model: data.Model}, nil
 }
 
 // ---------- 性能优化：分块 / 常驻服务 ----------
@@ -480,50 +611,59 @@ func doHTTP(cfg *config, req *http.Request) (*http.Response, error) {
 
 // corePolish 单段润色
 // coreText 单次调用（kind 只用于日志区分功能）
-func coreText(cfg *config, kind, prompt, text string) (string, error) {
+func coreText(cfg *config, kind, prompt, text string) (procResult, error) {
 	return callAPI(cfg, kind, prompt, text)
 }
 
 // segmented 通用入口：文本不超过 cfg.maxText 时一次调用；超长则切片并拼接。
 // 润色与翻译共用（两者都只是"换个提示词调用大模型"，分块策略完全一致）。
-func segmented(cfg *config, kind, prompt, text string) (string, error) {
+// Model 取最后一个非空值：同一批分块通常是同一个模型，取到即可供界面展示。
+func segmented(cfg *config, kind, prompt, text string) (procResult, error) {
 	runes := []rune(text)
 	if len(runes) <= cfg.maxText {
 		return coreText(cfg, kind, prompt, text)
 	}
 	overlap := 30
 	var sb strings.Builder
+	model := ""
 	for i := 0; i < len(runes); i += (cfg.maxText - overlap) {
 		end := i + cfg.maxText
 		if end > len(runes) {
 			end = len(runes)
 		}
-		chunk := string(runes[i:end])
-		content, err := coreText(cfg, kind, prompt, chunk)
+		res, err := coreText(cfg, kind, prompt, string(runes[i:end]))
 		if err != nil {
-			return "", err
+			return procResult{}, err
 		}
-		sb.WriteString(cleanOutput(content))
+		sb.WriteString(cleanOutput(res.Text))
+		if res.Model != "" {
+			model = res.Model
+		}
 		if end == len(runes) {
 			break
 		}
 	}
-	return sb.String(), nil
+	return procResult{Text: sb.String(), Model: model}, nil
 }
 
 // processPolish 润色入口
-func processPolish(cfg *config, text string) (string, error) {
+func processPolish(cfg *config, text string) (procResult, error) {
 	return segmented(cfg, "润色", polishPrompt, text)
 }
 
 // processTranslate 翻译入口：把文本翻译成简体中文（v5.6 新增，前端 F10 调用）
-func processTranslate(cfg *config, text string) (string, error) {
+func processTranslate(cfg *config, text string) (procResult, error) {
 	return segmented(cfg, "翻译", translatePrompt, text)
 }
 
+// modelHeader 把"实际使用的模型名"回给前端的响应头。
+// 走响应头而不改响应体：现有前端契约是纯文本（含 __NO_KEY__ / __ERROR__ 前缀），
+// 改成 JSON 会破坏它，也会动到全部既有测试。
+const modelHeader = "X-Model"
+
 // textHandler 生成文本处理端点（/polish 与 /translate 共用同一套
 // 取配置→读 body→错误映射逻辑，只是处理函数不同）
-func textHandler(store *configStore, run func(*config, string) (string, error)) http.HandlerFunc {
+func textHandler(store *configStore, run func(*config, string) (procResult, error)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// ★ 每个请求都取一次当前配置（内部按文件内容指纹判是否重载）。
 		// 这样即便本进程是上一次遗留的"僵尸后端"，改了 app.ini 后下一次调用
@@ -540,16 +680,20 @@ func textHandler(store *configStore, run func(*config, string) (string, error)) 
 			io.WriteString(w, "")
 			return
 		}
-		content, err := run(cfg, text)
+		res, err := run(cfg, text)
 		if err != nil {
 			io.WriteString(w, "__ERROR__"+err.Error())
 			return
 		}
-		if strings.TrimSpace(content) == "" {
+		if strings.TrimSpace(res.Text) == "" {
 			io.WriteString(w, "__ERROR__空响应")
 			return
 		}
-		io.WriteString(w, content)
+		// 头必须在写 body 之前设置；拿不到模型名就不发该头，前端会隐藏对应展示
+		if res.Model != "" {
+			w.Header().Set(modelHeader, res.Model)
+		}
+		io.WriteString(w, res.Text)
 	}
 }
 
@@ -583,8 +727,9 @@ func startServer(store *configStore) {
 	})
 
 	addr := "127.0.0.1:" + cfg.serverPort
-	rawLog(fmt.Sprintf("常驻服务启动 | 监听 %s | model=%s | base_url=%s",
-		addr, cfg.model, cfg.baseURL))
+	// 把实际生效的日志路径写进日志，便于确认 [log] dir 是否按预期落位
+	rawLog(fmt.Sprintf("常驻服务启动 | 监听 %s | model=%s | base_url=%s | 日志=%s",
+		addr, cfg.model, cfg.baseURL, currentLogPath()))
 	_ = http.ListenAndServe(addr, mux)
 }
 
@@ -625,11 +770,12 @@ func main() {
 	exeDir := filepath.Dir(exePath) // .../dist/runtime
 	rootDir := filepath.Dir(exeDir) // 部署根（dist/）
 	iniPath := filepath.Join(rootDir, "config", "app.ini")
-	logPath = filepath.Join(rootDir, "config", "ai_debug.log")
 
-	// 配置经 configStore 统一提供：
-	//   · -server 模式：每个请求前检查文件是否变更，变了立即热重载（见 configStore 注释）
-	//   · -polish / -translate 模式：一次性进程，读一次即可
+	// 部署根是全局基准：启动器与 [log] dir 的相对路径都相对它解析
+	baseDir = rootDir
+
+	// 日志文件路径由配置决定（[log] dir），未配置则用默认目录 <部署根>\config；
+	// 具体解析与"不可写则回退"的逻辑都在 applyLogConfig 里，随 configStore 一起生效
 	store := newConfigStore(iniPath)
 	cfg := store.current()
 
@@ -687,7 +833,7 @@ func main() {
 	// 调用云端 AI（超长自动切片）
 	rawLog(fmt.Sprintf("发送请求 | text长度=%d | model=%s | url=%s", len(text), cfg.model, cfg.baseURL))
 	start := time.Now()
-	content, err := run(cfg, text)
+	res, err := run(cfg, text)
 	if err != nil {
 		elapsed := time.Since(start).Seconds()
 		rawLog(fmt.Sprintf("调用失败 | 耗时=%.2fs | %v", elapsed, err))
@@ -697,8 +843,9 @@ func main() {
 	elapsed := time.Since(start).Seconds()
 
 	// 写结果文本（完整响应体已由 callAPI 记入日志，此处不再重复记录预览）
-	result := cleanOutput(content)
-	rawLog(fmt.Sprintf("收到响应 | 耗时=%.2fs | %s后长度=%d", elapsed, verb, len(result)))
+	result := cleanOutput(res.Text)
+	rawLog(fmt.Sprintf("收到响应 | 耗时=%.2fs | 实际模型=%s | %s后长度=%d",
+		elapsed, res.Model, verb, len(result)))
 	if result == "" {
 		rawLog(fmt.Sprintf("解析结果 | %s文本为空", verb))
 		_ = os.WriteFile(outPath, []byte("__ERROR__空响应\n"), 0644)

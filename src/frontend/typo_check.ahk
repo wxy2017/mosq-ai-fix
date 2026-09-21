@@ -78,6 +78,11 @@ if !A_IsAdmin && A_Args.Length = 0 {
 ;   2. 与润色共用选区判定逻辑 ReadInputText()：有选区翻选区，无选区翻整个输入框
 ;   3. 连通性自检：自检会探测 /translate 端点（POST 空文本，不消耗额度）
 ;   4. 两热键分别注册：某一个被占用时不影响另一个，并明确指出冲突项
+;   5. 译文与原文等价（代码标识符/专有名词/已是中文）时，窗口用橙色文字说明，
+;      避免"上下两块一模一样"被误读成翻译失败
+;   6. 润色/翻译窗口的**标题栏追加实际使用的模型名**（方案 B）：
+;      后端把响应体里的 model 字段经响应头 X-Model 回传，前端取到就拼成
+;      「mosq-ai-fix · 预览（自动全选） — deepseek-flash」；取不到则不加，不显示"未知"
 ; =============================================================
 
 ; ---------------- 程序显示名（唯一来源，改这里即可全局生效）----------------
@@ -148,6 +153,8 @@ RunSelfTest() {
     rep .= "润色状态: " p[1] "，结果长度 " StrLen(p[2]) " 字`n"
     if p[2] != ""
         rep .= "  " p[2] "`n"
+    ; 实际模型来自响应头 X-Model（界面标题栏展示的就是它），顺带验证这条链路通了
+    rep .= "实际模型: " (Trim(p[3]) = "" ? "未返回（后端过旧或上游未回 model 字段）" : p[3]) "`n"
     ; 翻译只探测端点是否就绪（POST 空文本，后端不调用大模型、不消耗额度）
     rep .= "翻译端点: " (EndpointReady("translate") ? "可用（/translate 已就绪）" : "不可用（后端过旧或未启动，请重新构建部署）") "`n"
 
@@ -325,8 +332,10 @@ IsServerUp() {
     }
 }
 
-; 调用本地服务端点，返回 UTF-8 解码后的响应文本
-; endpoint: 端点名（v5.2 起仅 "polish"）
+; 调用本地服务端点，返回 [body, model]
+;   body  : UTF-8 解码后的响应文本
+;   model : 响应头 X-Model —— 后端回报的"实际服务本次请求的模型名"（取不到为空串）
+;           注意它可能被上游/中转改写，与 app.ini 里填的 model 不一定相同
 HttpPost(endpoint, text) {
     global ServerPort
     http := ComObject("WinHttp.WinHttpRequest.5.1")
@@ -344,7 +353,9 @@ HttpPost(endpoint, text) {
     http.Send(stream.Read())
     if (http.Status != 200)
         throw Error("HTTP " http.Status)
-    return BytesToUtf8(http.ResponseBody)
+    model := ""
+    try model := Trim(http.GetResponseHeader("X-Model"))   ; 头不存在时返回空串
+    return [BytesToUtf8(http.ResponseBody), model]
 }
 
 ; 将 WinHttpRequest 的二进制响应体按 UTF-8 正确解码为字符串（避免中文乱码）
@@ -360,36 +371,37 @@ BytesToUtf8(body) {
 }
 
 ; ---------------- 调用本地常驻服务（v5.0；v5.6 起润色/翻译共用）----------------
-; 返回 [status, result]
+; 返回 [status, result, model]
 ;   status : "ok" 正常 | "no_key" 未配置 Key | "no_python" 未能启动程序 | "error" 调用失败
 ;   result : 处理后的整段文本（ok 时）
+;   model  : 实际使用的模型名（ok 时可能为空串，供界面标题展示）
 ; endpoint: "polish" 润色 | "translate" 翻译成中文
 RunEndpoint(endpoint, text) {
     ; 1. 确保常驻服务已启动
     if !EnsureServer()
-        return ["no_python", ""]
+        return ["no_python", "", ""]
 
     ; 2. 调用端点；若服务异常则尝试重启一次再调用
     try {
-        content := HttpPost(endpoint, text)
+        r := HttpPost(endpoint, text)
     } catch {
         if !EnsureServer() {
-            return ["error", ""]
+            return ["error", "", ""]
         }
         try {
-            content := HttpPost(endpoint, text)
+            r := HttpPost(endpoint, text)
         } catch {
-            return ["error", ""]
+            return ["error", "", ""]
         }
     }
 
-    content := Trim(content, "`r`n")
+    content := Trim(r[1], "`r`n")
     if SubStr(content, 1, 2) = "__" {
         if InStr(content, "NO_KEY")
-            return ["no_key", ""]
-        return ["error", ""]
+            return ["no_key", "", ""]
+        return ["error", "", ""]
     }
-    return ["ok", content]
+    return ["ok", content, r[2]]
 }
 
 ; 润色（F9）
@@ -540,7 +552,7 @@ PolishText(*) {
     }
 
     ; 4. 弹窗预览润色结果（可编辑微调），确认后按原模式替换
-    ShowPolishGui(text, p[2], WinGetID("A"), mode)
+    ShowPolishGui(text, p[2], WinGetID("A"), mode, p[3])
 }
 
 ; ---------------- 主流程：翻译成中文（v5.6，默认 F10）----------------
@@ -594,17 +606,23 @@ TranslateText(*) {
     }
 
     ; 4. 展示译文（只读，不影响原文）
-    ShowTranslateGui(text, p[2], mode)
+    ShowTranslateGui(text, p[2], mode, p[3])
 }
 
 ; ---------------- 译文窗口（v5.6）----------------
 ; 上下两块：上为原文（只读、灰色，便于对照），下为中文译文（只读、可选中复制）。
 ; 刻意**不提供"替换原文"**：翻译的用途是"看懂"，误覆盖原文的代价太高；
 ; 需要回填时点「复制译文」再自行粘贴即可。
-ShowTranslateGui(orig, translated, mode) {
+; model = 实际使用的模型名（响应头 X-Model），为空则标题不追加。
+ShowTranslateGui(orig, translated, mode, model := "") {
     scopeText := (mode = "sel") ? "已选中的 " StrLen(orig) " 字" : "整个输入框（未检测到选区）"
 
-    myGui := Gui("+AlwaysOnTop", AppName " · 翻译成中文")
+    ; 译文与原文等价时给出明确说明。否则界面上下两块内容一模一样，
+    ; 用户会以为"翻译没生效"（实际是代码标识符/专有名词/已是中文这类无需翻译的内容，
+    ; 模型按规则保留了原文——行为正确，但必须让用户看得出来）。
+    sameAsSource := NormForCompare(translated) = NormForCompare(orig)
+
+    myGui := Gui("+AlwaysOnTop", TitleWithModel(AppName " · 翻译成中文", model))
     myGui.SetFont("s10", "Microsoft YaHei")
 
     myGui.SetFont("s9 norm")
@@ -614,6 +632,8 @@ ShowTranslateGui(orig, translated, mode) {
 
     myGui.SetFont("s9 norm")
     myGui.Add("Text", "w620 c6B7280", "中文译文（可选中复制；如需回填原文，点「复制译文」后自行粘贴）")
+    if sameAsSource
+        myGui.Add("Text", "w620 cB45309", "注意：译文与原文完全相同。该内容通常无需翻译（代码标识符、专有名词、符号数字，或本身已是中文），工具按规则原样返回，并非失败。")
     myGui.SetFont("s10")
     trans := myGui.Add("Edit", "w620 h220 ReadOnly", translated)
 
@@ -622,6 +642,23 @@ ShowTranslateGui(orig, translated, mode) {
     btnCopy.OnEvent("Click", (*) => CopyTranslation(myGui, trans))
     btnClose.OnEvent("Click", (*) => myGui.Destroy())
     myGui.Show()
+}
+
+; 归一化后比较：去掉首尾空白与 BOM（从文件复制来的文本常带 U+FEFF），
+; 用于判断"译文是否与原文等价"，避免把"去掉了 BOM"误判成"翻译过了"。
+NormForCompare(s) {
+    s := StrReplace(s, Chr(0xFEFF), "")
+    return Trim(s)
+}
+
+; 窗口标题：在基础标题后追加实际使用的模型名（方案 B：标题栏展示）。
+;   base  = 如 "mosq-ai-fix · 预览（自动全选）"
+;   model = 响应头 X-Model 的值；为空（老后端 / 未返回）时不追加，避免出现"未知"之类的噪音
+TitleWithModel(base, model) {
+    m := Trim(model)
+    if m = ""
+        return base
+    return base " — " m
 }
 
 ; 把译文写入剪贴板（保留原有剪贴板内容不做恢复：用户点"复制"就是要用它）
@@ -636,18 +673,18 @@ CopyTranslation(myGui, transCtrl) {
     TrayTip("译文已复制到剪贴板", AppName, 3)
 }
 
-; ---------------- 润色结果弹窗（v5.0；v5.4 起标注模式）----------------
+; ---------------- 润色结果弹窗（v5.0；v5.4 起标注模式；v5.6 起标题附实际模型）----------------
 ; 展示润色后的文本，Edit 可直接编辑微调；点"替换原文"按 mode 回填
-;   mode = "sel" → 只覆盖原选区
-;   mode = "all" → 覆盖整个输入框
-ShowPolishGui(orig, polished, targetHwnd, mode) {
+;   mode  = "sel" → 只覆盖原选区；"all" → 覆盖整个输入框
+;   model = 实际使用的模型名（来自响应头 X-Model）；为空则标题不追加，避免噪音
+ShowPolishGui(orig, polished, targetHwnd, mode, model := "") {
     modeName := (mode = "sel") ? "手动选区" : "自动全选"
     if mode = "sel"
         modeHint := "手动选区模式：已选中 " StrLen(orig) " 字。点「替换原文」只覆盖选中的这一段，选区之外的文字保持不动。"
     else
         modeHint := "自动全选模式：未检测到选区，点「替换原文」将替换整个输入框的内容。"
 
-    myGui := Gui("+AlwaysOnTop", AppName " · 预览（" modeName "）")
+    myGui := Gui("+AlwaysOnTop", TitleWithModel(AppName " · 预览（" modeName "）", model))
     myGui.SetFont("s10", "Microsoft YaHei")
     myGui.Add("Text", "w560", "润色结果（可直接编辑微调）：")
     myGui.SetFont("s9 norm")
